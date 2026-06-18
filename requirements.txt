@@ -1,0 +1,4 @@
+discord.py[voice]>=2.3
+soundcard>=0.4.3
+numpy>=1.24
+python-dotenv>=1.0
