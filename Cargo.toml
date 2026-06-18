@@ -1,6 +1,6 @@
 [package]
 name = "pepsistreamy"
-version = "2.3.2"
+version = "2.4.0"
 edition = "2024"
 description = "내 PC 소리(유튜브 등)를 디스코드 음성 채널로 실시간 방송하는 네이티브 CLI"
 license = "MIT"
@@ -14,6 +14,8 @@ serenity = { version = "0.12.5", default-features = false, features = ["client",
 songbird = "0.6.0"
 sysinfo = { version = "0.39.3", default-features = false, features = ["system"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "signal"] }
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 wasapi = "0.23.0"
 windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 

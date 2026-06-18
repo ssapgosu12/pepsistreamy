@@ -163,6 +163,12 @@ impl CaptureHandle {
     pub fn dsp_label(&self) -> Option<&str> {
         self.dsp_label.as_deref()
     }
+    /// 같은 캡처에서 새 리더 생성(예: /leave 후 재-/join 시 songbird 에 줄 리더).
+    pub fn new_reader(&self) -> CaptureReader {
+        CaptureReader {
+            shared: self.shared.clone(),
+        }
+    }
 }
 
 /// 캡처 시작. WASAPI 초기화가 끝날 때까지 기다렸다 (핸들, 리더) 반환.
@@ -174,13 +180,14 @@ pub fn start(
     let shared = Arc::new(Shared::new());
     let source_label = source.label();
     let dsp_label = dsp.as_ref().map(|d| d.label().to_string());
+    set_live_dsp(dsp); // DSP 는 전역으로 — 실행 중 라이브 교체 가능
 
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let sh = shared.clone();
     let join = thread::Builder::new()
         .name("pepsi-capture".into())
         .spawn(move || {
-            if let Err(e) = run_capture(&sh, source, dsp, monitor, &tx) {
+            if let Err(e) = run_capture(&sh, source, monitor, &tx) {
                 let msg = e.to_string();
                 *sh.error.lock().unwrap() = Some(msg.clone());
                 let _ = tx.send(Err(msg));
@@ -205,7 +212,6 @@ pub fn start(
 fn run_capture(
     shared: &Arc<Shared>,
     source: CaptureSource,
-    mut dsp: Option<DspChain>,
     monitor_spec: Option<crate::monitor::MonitorSpec>,
     tx: &Sender<Result<(), String>>,
 ) -> Result<()> {
@@ -297,7 +303,8 @@ fn run_capture(
             continue;
         }
         let mut bytes: Vec<u8> = local.drain(..).collect();
-        if let Some(dsp) = &mut dsp {
+        // DSP 는 전역(라이브 교체 가능). 매번 현재 설정으로 처리.
+        if let Some(dsp) = LIVE_DSP.lock().unwrap().as_mut() {
             apply_dsp(dsp, &mut bytes);
         }
         if let Some(m) = &monitor {
@@ -321,6 +328,17 @@ static LEVEL: AtomicU32 = AtomicU32::new(0); // 피크 진폭 ×10000
 /// 현재 캡처 피크 레벨(0.0~1.0). 캡처가 없으면 0.
 pub fn current_level() -> f32 {
     LEVEL.load(Ordering::Relaxed) as f32 / 10000.0
+}
+
+// ---- 라이브 DSP (전역, 실행 중 교체 가능) ----
+static LIVE_DSP: Mutex<Option<DspChain>> = Mutex::new(None);
+
+/// DSP 체인을 라이브로 교체(None=끄기). 캡처를 재시작하지 않고 즉시 적용된다.
+pub fn set_live_dsp(dsp: Option<DspChain>) {
+    *LIVE_DSP.lock().unwrap() = dsp;
+}
+pub fn live_dsp_on() -> bool {
+    LIVE_DSP.lock().unwrap().is_some()
 }
 
 fn update_level(bytes: &[u8]) {

@@ -693,13 +693,21 @@ pub enum Outcome {
     Quit,   // 완전 종료
 }
 
-/// 봇을 백그라운드로 실행하고 상태/볼륨 화면을 띄운다. Esc/q=설정, Ctrl+C=종료.
+enum RunOut {
+    Config,
+    Quit,
+    EditDsp,
+}
+
+/// 봇을 백그라운드로 실행하고 상태/볼륨 화면을 띄운다. Esc/q=설정, Ctrl+C=종료, t=DSP토글, d=DSP패널.
 pub async fn run_bot_screen() -> Result<Outcome> {
     let (token, guild_id) = match crate::bot::token_and_guild() {
         Ok(v) => v,
         Err(_) => return Ok(Outcome::Config),
     };
     crate::bot::set_quiet(true);
+    crate::bot::init_logging();
+    crate::bot::prestart_capture(); // 미터가 /join 전에도 동작하도록 캡처 미리 시작
     let client = crate::bot::build_client(&token, guild_id).await?;
     let shard = client.shard_manager.clone();
     let bot_task = tokio::spawn(async move {
@@ -707,9 +715,19 @@ pub async fn run_bot_screen() -> Result<Outcome> {
         let _ = client.start().await;
     });
 
-    let outcome = tokio::task::spawn_blocking(running_loop)
-        .await
-        .unwrap_or(Outcome::Quit);
+    let outcome = loop {
+        match tokio::task::spawn_blocking(running_loop)
+            .await
+            .unwrap_or(RunOut::Quit)
+        {
+            RunOut::Config => break Outcome::Config,
+            RunOut::Quit => break Outcome::Quit,
+            RunOut::EditDsp => {
+                // DSP 패널(블로킹) — 라이브 적용. 봇은 계속 실행. 끝나면 실행화면 재진입.
+                let _ = tokio::task::spawn_blocking(edit_dsp_live).await;
+            }
+        }
+    };
 
     shard.shutdown_all().await;
     bot_task.abort();
@@ -718,7 +736,14 @@ pub async fn run_bot_screen() -> Result<Outcome> {
     Ok(outcome)
 }
 
-fn running_loop() -> Outcome {
+fn apply_live_dsp(s: &Settings) {
+    let dsp = s
+        .dsp_enabled
+        .then(|| crate::dsp::DspChain::from_params(crate::capture::SAMPLE_RATE as f32, &s.dsp));
+    crate::capture::set_live_dsp(dsp);
+}
+
+fn running_loop() -> RunOut {
     let mut terminal = ratatui::init();
     let out = loop {
         let _ = terminal.draw(draw_running);
@@ -729,9 +754,17 @@ fn running_loop() -> Outcome {
                 }
                 match k.code {
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        break Outcome::Quit;
+                        break RunOut::Quit;
                     }
-                    KeyCode::Esc | KeyCode::Char('q') => break Outcome::Config,
+                    KeyCode::Esc | KeyCode::Char('q') => break RunOut::Config,
+                    KeyCode::Char('t') | KeyCode::Char('T') => {
+                        // DSP 라이브 토글
+                        let mut s = Settings::load();
+                        s.dsp_enabled = !s.dsp_enabled;
+                        s.save().ok();
+                        apply_live_dsp(&s);
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') => break RunOut::EditDsp,
                     _ => {}
                 }
             }
@@ -739,6 +772,106 @@ fn running_loop() -> Outcome {
     };
     ratatui::restore();
     out
+}
+
+/// 봇 송출 중 DSP 패널(블로킹). 값 바꾸면 즉시 라이브 적용 + setting.ini 저장.
+fn edit_dsp_live() {
+    let mut s = Settings::load();
+    let mut sel = 0usize; // 0=on/off, 1..=6 = 파라미터
+    let mut terminal = ratatui::init();
+    loop {
+        let _ = terminal.draw(|f| draw_dsp_editor(f, &s, sel));
+        if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
+            if let Ok(Event::Key(k)) = event::read() {
+                if k.kind != KeyEventKind::Press {
+                    continue;
+                }
+                let mut changed = true;
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => break,
+                    KeyCode::Up => sel = sel.saturating_sub(1),
+                    KeyCode::Down => sel = (sel + 1).min(6),
+                    KeyCode::Enter | KeyCode::Char('t') if sel == 0 => {
+                        s.dsp_enabled = !s.dsp_enabled
+                    }
+                    KeyCode::Left | KeyCode::Char('-') if sel >= 1 => {
+                        let i = sel - 1;
+                        let v = dsp_get(&s.dsp, i).saturating_sub(1);
+                        dsp_set(&mut s.dsp, i, v);
+                        s.dsp_enabled = true;
+                    }
+                    KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('=') if sel >= 1 => {
+                        let i = sel - 1;
+                        let v = (dsp_get(&s.dsp, i) + 1).min(100);
+                        dsp_set(&mut s.dsp, i, v);
+                        s.dsp_enabled = true;
+                    }
+                    _ => changed = false,
+                }
+                if changed {
+                    s.save().ok();
+                    apply_live_dsp(&s);
+                }
+            }
+        }
+    }
+    ratatui::restore();
+}
+
+fn draw_dsp_editor(f: &mut Frame, s: &Settings, sel: usize) {
+    let p = &s.dsp;
+    let mut rows = vec![Constraint::Length(2)];
+    rows.extend([Constraint::Length(1); 6]);
+    rows.push(Constraint::Min(1));
+    let chunks = Layout::vertical(rows).split(f.area());
+
+    let en = if s.dsp_enabled {
+        "[켜짐]"
+    } else {
+        "[꺼짐]"
+    };
+    let head = Paragraph::new(format!(
+        "DSP {en}  (방송 중 라이브 적용)   HP {:.0}Hz Q{:.1} · LP {:.0}Hz Q{:.1} · room {:.2} · mix {:.2}",
+        p.hp_hz(),
+        p.hp_q(),
+        p.lp_hz(),
+        p.lp_q(),
+        p.room01(),
+        p.mix01()
+    ))
+    .style(if sel == 0 {
+        Style::default().fg(Color::Black).bg(Color::Cyan)
+    } else {
+        Style::default()
+    });
+    f.render_widget(head, chunks[0]);
+
+    for i in 0..6 {
+        let v = dsp_get(p, i);
+        let selected = sel == i + 1;
+        let g = Gauge::default()
+            .gauge_style(if selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Cyan)
+            })
+            .ratio(v as f64 / 100.0)
+            .label(format!(
+                "{}{}: {v}",
+                if selected { "➤ " } else { "  " },
+                DSP_LABELS[i]
+            ));
+        f.render_widget(g, chunks[i + 1]);
+    }
+    let help =
+        Paragraph::new("↑↓ 선택 · ←→/+- 값 · Enter/t 켜기끄기 · Esc 송출화면으로 (변경 즉시 적용)")
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("DSP 패널 (라이브)"),
+            )
+            .wrap(Wrap { trim: true });
+    f.render_widget(help, chunks[7]);
 }
 
 fn draw_running(f: &mut Frame) {
@@ -772,6 +905,14 @@ fn draw_running(f: &mut Frame) {
             Some((src, None)) => Line::from(format!("소스: {src}")),
             None => Line::from("소스: (대기)"),
         },
+        Line::from(format!(
+            "DSP: {}",
+            if crate::capture::live_dsp_on() {
+                "켜짐"
+            } else {
+                "꺼짐"
+            }
+        )),
     ])
     .block(Block::default().borders(Borders::ALL).title("상태"))
     .wrap(Wrap { trim: true });
@@ -795,7 +936,7 @@ fn draw_running(f: &mut Frame) {
     f.render_widget(gauge, chunks[2]);
 
     let help = Paragraph::new(
-        "Esc/q → 설정으로 · Ctrl+C → 완전 종료   |   디스코드: /join  /reload  /leave  /status",
+        "t → DSP 켜기/끄기 · d → DSP 패널 · Esc/q → 설정 · Ctrl+C → 종료   |   디스코드: /join /leave /reload",
     )
     .block(Block::default().borders(Borders::ALL))
     .wrap(Wrap { trim: true });

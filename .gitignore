@@ -9,3 +9,6 @@ target/
 .venv/
 __pycache__/
 *.pyc
+
+# 진단 로그
+pepsistreamy.log

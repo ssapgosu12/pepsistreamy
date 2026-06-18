@@ -12,19 +12,65 @@ use songbird::SerenityInit;
 use songbird::input::RawAdapter;
 use songbird::input::core::io::ReadOnlySource;
 
-use crate::capture::{self, CaptureHandle, CaptureSource};
+use crate::capture::{self, CaptureHandle, CaptureReader, CaptureSource};
 use crate::dsp::DspChain;
 use crate::monitor::MonitorSpec;
 use crate::settings::Settings;
 
 static CAPTURE: OnceLock<Mutex<Option<CaptureHandle>>> = OnceLock::new();
+static PENDING_READER: Mutex<Option<CaptureReader>> = Mutex::new(None);
 static CONNECTED: AtomicBool = AtomicBool::new(false);
 static LISTENERS: AtomicUsize = AtomicUsize::new(0);
 static QUIET: AtomicBool = AtomicBool::new(false);
 static STATUS: Mutex<String> = Mutex::new(String::new());
+static LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 
 fn slot() -> &'static Mutex<Option<CaptureHandle>> {
     CAPTURE.get_or_init(|| Mutex::new(None))
+}
+
+/// songbird/serenity 진단 로그를 pepsistreamy.log 파일로(한 번만 설정).
+pub fn init_logging() {
+    if LOG_GUARD.get().is_some() {
+        return;
+    }
+    let appender = tracing_appender::rolling::never(".", "pepsistreamy.log");
+    let (nb, guard) = tracing_appender::non_blocking(appender);
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("warn,songbird=debug,serenity=info")
+    });
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(nb)
+        .with_env_filter(filter)
+        .try_init();
+    let _ = LOG_GUARD.set(guard);
+}
+
+/// 실행 화면 진입 시 캡처를 미리 시작(볼륨미터가 /join 전에도 동작하도록). 리더는 보관.
+pub fn prestart_capture() {
+    if slot().lock().unwrap().is_some() {
+        return; // 이미 떠 있음
+    }
+    match build_config() {
+        Ok((source, dsp, monitor)) => match capture::start(source, dsp, monitor) {
+            Ok((handle, reader)) => {
+                *slot().lock().unwrap() = Some(handle);
+                *PENDING_READER.lock().unwrap() = Some(reader);
+            }
+            Err(e) => set_status(format!("미리 캡처 시작 실패: {e}")),
+        },
+        Err(e) => set_status(format!("설정 오류: {e}")),
+    }
+}
+
+/// 음성만 끊고 캡처는 유지(미터 계속). 종료/화면닫기에서는 stop_capture 사용.
+async fn disconnect(ctx: &Context, guild_id: GuildId) {
+    CONNECTED.store(false, Ordering::Relaxed);
+    LISTENERS.store(0, Ordering::Relaxed);
+    if let Some(m) = songbird::get(ctx).await {
+        let _ = m.remove(guild_id).await;
+    }
 }
 
 // ---- TUI 가 읽는 전역 상태 ----
@@ -57,11 +103,12 @@ fn set_status(msg: impl Into<String>) {
     *STATUS.lock().unwrap() = msg;
 }
 
-/// 캡처 중지 + 상태 초기화(연결 종료 시).
+/// 캡처 완전 중지 + 상태 초기화(실행 화면 닫을 때).
 pub fn stop_capture() {
     if let Some(mut h) = slot().lock().unwrap().take() {
         h.stop();
     }
+    *PENDING_READER.lock().unwrap() = None;
     CONNECTED.store(false, Ordering::Relaxed);
     LISTENERS.store(0, Ordering::Relaxed);
 }
@@ -142,11 +189,8 @@ impl EventHandler for Handler {
                 .count()
         };
         LISTENERS.store(count, Ordering::Relaxed);
-        if count == 0 {
-            stop_capture();
-            if let Some(m) = songbird::get(&ctx).await {
-                let _ = m.remove(guild_id).await;
-            }
+        if count == 0 && is_connected() {
+            disconnect(&ctx, guild_id).await; // 캡처는 유지(미터 계속)
             set_status("채널에 아무도 없어 자동 퇴장했습니다.");
         }
     }
@@ -181,20 +225,35 @@ pub(crate) fn build_config()
     Ok((source, dsp, monitor))
 }
 
-/// 캡처를 (재)시작해 주어진 Call 에 송출한다.
-async fn apply_capture(
-    call: &std::sync::Arc<serenity::prelude::Mutex<songbird::Call>>,
-) -> Result<(), String> {
+/// 새 설정으로 캡처를 시작해 슬롯에 저장하고 리더 반환.
+fn start_and_store() -> Result<CaptureReader, String> {
     let (source, dsp, monitor) = build_config().map_err(|e| format!("설정 오류: {e}"))?;
     let (handle, reader) =
         capture::start(source, dsp, monitor).map_err(|e| format!("캡처 시작 실패: {e}"))?;
-    {
-        let mut g = slot().lock().unwrap();
-        if let Some(mut old) = g.take() {
-            old.stop();
-        }
-        *g = Some(handle);
+    let mut g = slot().lock().unwrap();
+    if let Some(mut old) = g.take() {
+        old.stop();
     }
+    *g = Some(handle);
+    Ok(reader)
+}
+
+/// 캡처 리더를 Call 에 송출. restart=true 면 새 설정으로 캡처를 재시작(/reload),
+/// false 면 미리 시작된 캡처의 리더를 재사용(/join).
+async fn apply_capture(
+    call: &std::sync::Arc<serenity::prelude::Mutex<songbird::Call>>,
+    restart: bool,
+) -> Result<(), String> {
+    let reader = if restart {
+        *PENDING_READER.lock().unwrap() = None;
+        start_and_store()?
+    } else if let Some(r) = PENDING_READER.lock().unwrap().take() {
+        r
+    } else if let Some(r) = slot().lock().unwrap().as_ref().map(|h| h.new_reader()) {
+        r // 캡처는 떠 있는데 리더만 소비됨(재-/join) → 새 리더
+    } else {
+        start_and_store()?
+    };
     let src = RawAdapter::new(
         ReadOnlySource::new(reader),
         capture::SAMPLE_RATE,
@@ -231,8 +290,7 @@ async fn handle_join(ctx: &Context, command: &CommandInteraction) -> String {
         Ok(c) => c,
         Err(e) => return format!("음성 채널 입장 실패: {e}"),
     };
-    if let Err(e) = apply_capture(&call).await {
-        stop_capture();
+    if let Err(e) = apply_capture(&call, false).await {
         let _ = manager.remove(guild_id).await;
         return e;
     }
@@ -253,7 +311,7 @@ async fn handle_reload(ctx: &Context, command: &CommandInteraction) -> String {
         Some(c) => c,
         None => return "연결돼 있지 않습니다. 먼저 `/join` 하세요.".to_string(),
     };
-    match apply_capture(&call).await {
+    match apply_capture(&call, true).await {
         Ok(_) => "🔄 설정을 다시 적용했습니다(소스/DSP/모니터).".to_string(),
         Err(e) => e,
     }
@@ -263,10 +321,7 @@ async fn handle_leave(ctx: &Context, command: &CommandInteraction) -> String {
     let Some(guild_id) = command.guild_id else {
         return "서버 안에서만 사용할 수 있습니다.".to_string();
     };
-    stop_capture();
-    if let Some(manager) = songbird::get(ctx).await {
-        let _ = manager.remove(guild_id).await;
-    }
+    disconnect(ctx, guild_id).await; // 캡처는 유지(미터 계속), 음성만 끊음
     set_status("방송 종료, 채널에서 나감");
     "⏹️ 방송 종료, 채널에서 나갔습니다.".to_string()
 }
@@ -342,6 +397,7 @@ pub async fn build_client(token: &str, guild_id: Option<u64>) -> anyhow::Result<
 /// 콘솔 모드 실행(`run` 명령). Ctrl+C 로 종료.
 pub async fn run() -> anyhow::Result<()> {
     set_quiet(false);
+    init_logging();
     let (token, guild_id) = token_and_guild()?;
     let mut client = build_client(&token, guild_id).await?;
     println!("[pepsistreamy] 봇 시작 중... (Ctrl+C 로 종료)");
