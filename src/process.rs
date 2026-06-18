@@ -52,6 +52,10 @@ pub fn list_audio() -> Vec<(String, usize)> {
         Ok(p) => p,
         Err(_) => return Vec::new(),
     };
+    let debug = std::env::var("YTCAST_DEBUG").is_ok();
+    if debug {
+        eprintln!("[audio-dbg] 오디오 세션 PID들: {pids:?}");
+    }
     if pids.is_empty() {
         return Vec::new();
     }
@@ -59,40 +63,66 @@ pub fn list_audio() -> Vec<(String, usize)> {
         .into_iter()
         .map(|(pid, name, _)| (pid, name))
         .collect();
+    if debug {
+        for pid in &pids {
+            eprintln!(
+                "[audio-dbg]   PID {pid} → {}",
+                names
+                    .get(pid)
+                    .cloned()
+                    .unwrap_or_else(|| "(이름 못 찾음)".into())
+            );
+        }
+    }
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for pid in pids {
-        if let Some(name) = names.get(&pid) {
-            *counts.entry(name.clone()).or_insert(0) += 1;
-        }
+        // 이름을 못 찾아도 버리지 않고 PID 로 표시(값으로도 PID 가 되어 resolve 가능).
+        let name = names.get(&pid).cloned().unwrap_or_else(|| pid.to_string());
+        *counts.entry(name).or_insert(0) += 1;
     }
     let mut v: Vec<(String, usize)> = counts.into_iter().collect();
     v.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
     v
 }
 
-/// 기본 출력장치의 오디오 세션을 열거해, 소리를 내는 프로세스 PID들을 모은다(만료 세션·시스템(0) 제외).
+/// **모든** 출력장치의 오디오 세션을 열거해, 소리를 내는 프로세스 PID들을 모은다
+/// (만료 세션·시스템(0) 제외). 크롬이 기본장치가 아닌 곳으로 출력해도 잡히도록 전 장치를 본다.
 fn audio_session_pids() -> Result<Vec<u32>> {
     use wasapi::{Direction, SessionState};
     let _ = wasapi::initialize_mta();
-    let device = wasapi::DeviceEnumerator::new()?.get_default_device(&Direction::Render)?;
-    let manager = device.get_iaudiosessionmanager()?;
-    let enumerator = manager.get_audiosessionenumerator()?;
-    let count = enumerator.get_count()?;
+    let devices = wasapi::DeviceEnumerator::new()?.get_device_collection(&Direction::Render)?;
+    let ndev = devices.get_nbr_devices()?;
     let mut pids = Vec::new();
-    for i in 0..count {
-        let Ok(session) = enumerator.get_session(i) else {
+    for di in 0..ndev {
+        let Ok(device) = devices.get_device_at_index(di) else {
             continue;
         };
-        // 만료된(프로세스 종료) 세션은 제외
-        if let Ok(SessionState::Expired) = session.get_state() {
+        let Ok(manager) = device.get_iaudiosessionmanager() else {
             continue;
-        }
-        if let Ok(pid) = session.get_process_id() {
-            if pid != 0 {
-                pids.push(pid);
+        };
+        let Ok(enumerator) = manager.get_audiosessionenumerator() else {
+            continue;
+        };
+        let Ok(count) = enumerator.get_count() else {
+            continue;
+        };
+        for i in 0..count {
+            let Ok(session) = enumerator.get_session(i) else {
+                continue;
+            };
+            // 만료된(프로세스 종료) 세션은 제외
+            if let Ok(SessionState::Expired) = session.get_state() {
+                continue;
+            }
+            if let Ok(pid) = session.get_process_id() {
+                if pid != 0 {
+                    pids.push(pid);
+                }
             }
         }
     }
+    pids.sort_unstable();
+    pids.dedup();
     Ok(pids)
 }
 
