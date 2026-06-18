@@ -66,6 +66,7 @@ struct App {
     values: Vec<String>, // 항목별 실제 값(프로세스는 이름만 저장)
     input: String,       // 토큰/프로필명 입력
     msg: String,
+    proc_all: bool, // 프로세스 픽커: 전체(true) vs 소리나는 앱만(false)
     start_bot: bool,
     quit: bool,
 }
@@ -80,6 +81,7 @@ pub fn config() -> Result<bool> {
         values: Vec::new(),
         input: String::new(),
         msg: String::new(),
+        proc_all: false,
         start_bot: false,
         quit: false,
     };
@@ -201,6 +203,10 @@ impl App {
             (Screen::Dsp, 't') | (Screen::Dsp, 'T') => {
                 self.s.dsp_enabled = !self.s.dsp_enabled;
             }
+            (Screen::ProcessPick, 'a') | (Screen::ProcessPick, 'A') => {
+                self.proc_all = !self.proc_all;
+                self.load_process_list();
+            }
             (Screen::SourceKind, 'o') | (Screen::Monitor, 'o') => {
                 setup::open_url(setup::VBCABLE_URL);
                 self.msg = "VB-CABLE 다운로드 페이지를 열었습니다(VB-Audio 도네이션웨어).".into();
@@ -307,6 +313,32 @@ impl App {
         }
     }
 
+    fn load_process_list(&mut self) {
+        // 기본: 소리 나는 앱만(오디오 세션 있는). 없으면 전체. 'a' 로 전체 토글.
+        let named = if self.proc_all {
+            crate::process::list_named()
+        } else {
+            let audio = crate::process::list_audio();
+            if audio.is_empty() {
+                crate::process::list_named()
+            } else {
+                audio
+            }
+        };
+        self.items = named
+            .iter()
+            .map(|(name, n)| {
+                if *n > 1 {
+                    format!("{name}  ({n})")
+                } else {
+                    name.clone()
+                }
+            })
+            .collect();
+        self.values = named.into_iter().map(|(name, _)| name).collect();
+        self.sel = 0;
+    }
+
     fn source_kind_enter(&mut self) {
         match self.sel {
             0 => {
@@ -321,20 +353,8 @@ impl App {
                 self.screen = Screen::DevicePick;
             }
             2 => {
-                // 이름별로 묶어서 표시(같은 앱 한 줄). 값은 이름 → 실행 시 루트 자동 선택.
-                let named = crate::process::list_named();
-                self.items = named
-                    .iter()
-                    .map(|(name, n)| {
-                        if *n > 1 {
-                            format!("{name}  ({n}개)")
-                        } else {
-                            name.clone()
-                        }
-                    })
-                    .collect();
-                self.values = named.into_iter().map(|(name, _)| name).collect();
-                self.sel = 0;
+                self.proc_all = false;
+                self.load_process_list();
                 self.screen = Screen::ProcessPick;
             }
             _ => {
@@ -445,7 +465,12 @@ impl App {
             }
             Screen::ProcessPick => {
                 let items = self.items.clone();
-                self.render_list(f, chunks[1], "프로세스 선택 (PID  이름)", &items)
+                let title = if self.proc_all {
+                    "프로세스 선택 — 전체  (a: 소리나는 앱만)"
+                } else {
+                    "프로세스 선택 — 🔊 소리나는 앱만  (a: 전체보기)"
+                };
+                self.render_list(f, chunks[1], title, &items)
             }
             Screen::ProfileList => {
                 let items = self.items.clone();

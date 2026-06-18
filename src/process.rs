@@ -45,6 +45,57 @@ pub fn list_named() -> Vec<(String, usize)> {
     v
 }
 
+/// 지금 **오디오 세션이 있는(소리를 내고 있거나 최근에 낸)** 앱만 이름별로 묶어서 (이름, 세션수).
+/// 수백 개 프로세스 대신 chrome·spotify 같은 몇 개만 나온다. 실패하면 빈 벡터.
+pub fn list_audio() -> Vec<(String, usize)> {
+    let pids = match audio_session_pids() {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    let names: std::collections::HashMap<u32, String> = collect()
+        .into_iter()
+        .map(|(pid, name, _)| (pid, name))
+        .collect();
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for pid in pids {
+        if let Some(name) = names.get(&pid) {
+            *counts.entry(name.clone()).or_insert(0) += 1;
+        }
+    }
+    let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+    v.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    v
+}
+
+/// 기본 출력장치의 오디오 세션을 열거해, 소리를 내는 프로세스 PID들을 모은다(만료 세션·시스템(0) 제외).
+fn audio_session_pids() -> Result<Vec<u32>> {
+    use wasapi::{Direction, SessionState};
+    let _ = wasapi::initialize_mta();
+    let device = wasapi::DeviceEnumerator::new()?.get_default_device(&Direction::Render)?;
+    let manager = device.get_iaudiosessionmanager()?;
+    let enumerator = manager.get_audiosessionenumerator()?;
+    let count = enumerator.get_count()?;
+    let mut pids = Vec::new();
+    for i in 0..count {
+        let Ok(session) = enumerator.get_session(i) else {
+            continue;
+        };
+        // 만료된(프로세스 종료) 세션은 제외
+        if let Ok(SessionState::Expired) = session.get_state() {
+            continue;
+        }
+        if let Ok(pid) = session.get_process_id() {
+            if pid != 0 {
+                pids.push(pid);
+            }
+        }
+    }
+    Ok(pids)
+}
+
 /// PID(숫자) 또는 프로세스명(부분일치) → 캡처할 PID.
 /// 이름이 여러 개면 "루트"(부모가 같은 이름 집합 밖) 프로세스를 고른다 — 브라우저처럼
 /// 오디오를 자식(오디오 서비스) 프로세스에서 내는 경우 루트+트리포함으로 잡기 위함.

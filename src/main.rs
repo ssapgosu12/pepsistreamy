@@ -106,14 +106,28 @@ fn cmd_devices() {
 }
 
 fn cmd_processes() {
-    let list = process::list();
-    println!("실행 중 프로세스 (특정 앱만 캡처하려면 .env 에 YTCAST_PROCESS=PID 또는 이름):\n");
-    println!("  {:>8}  이름", "PID");
-    for (pid, name) in list {
-        println!("  {pid:>8}  {name}");
+    let fmt = |name: &str, n: usize| {
+        if n > 1 {
+            format!("  - {name}  ({n})")
+        } else {
+            format!("  - {name}")
+        }
+    };
+    let audio = process::list_audio();
+    if !audio.is_empty() {
+        println!("🔊 지금 소리 나는 앱 (이걸 캡처하면 됩니다):");
+        for (name, n) in &audio {
+            println!("{}", fmt(name, *n));
+        }
+    } else {
+        println!("(현재 오디오 세션이 있는 앱이 없습니다 — 유튜브 등 뭔가 재생해 보세요)");
+    }
+    println!("\n전체 앱 (이름별 묶음):");
+    for (name, n) in process::list_named() {
+        println!("{}", fmt(&name, n));
     }
     println!(
-        "\n예) 크롬만: YTCAST_PROCESS=chrome  (크롬은 모든 탭을 한 오디오 프로세스에서 섞으므로,\n   단일 탭만 분리하려면 그 탭을 전용 브라우저/프로필에 띄우세요.)"
+        "\n.env 에  YTCAST_PROCESS=chrome (이름) 또는 PID. 이름이면 실행 시 루트 프로세스를 자동 선택합니다.\n크롬은 모든 탭을 한 오디오 프로세스에서 섞으므로, 단일 탭만 분리하려면 전용 브라우저/프로필을 쓰세요."
     );
 }
 
