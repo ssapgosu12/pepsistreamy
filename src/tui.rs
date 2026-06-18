@@ -4,7 +4,7 @@
 use anyhow::Result;
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
@@ -70,7 +70,8 @@ struct App {
     quit: bool,
 }
 
-pub fn run() -> Result<bool> {
+/// 설정 화면(블로킹). true = "저장하고 봇 실행" 선택됨.
+pub fn config() -> Result<bool> {
     let mut app = App {
         s: Settings::load(),
         screen: Screen::Menu,
@@ -643,4 +644,115 @@ impl App {
             .highlight_symbol("➤ ");
         f.render_stateful_widget(list, area, &mut state);
     }
+}
+
+// ===== 봇 실행 화면 (라이브 볼륨바 + Esc 로 설정 복귀) =====
+
+pub enum Outcome {
+    Config, // 설정 메뉴로 복귀
+    Quit,   // 완전 종료
+}
+
+/// 봇을 백그라운드로 실행하고 상태/볼륨 화면을 띄운다. Esc/q=설정, Ctrl+C=종료.
+pub async fn run_bot_screen() -> Result<Outcome> {
+    let (token, guild_id) = match crate::bot::token_and_guild() {
+        Ok(v) => v,
+        Err(_) => return Ok(Outcome::Config),
+    };
+    crate::bot::set_quiet(true);
+    let client = crate::bot::build_client(&token, guild_id).await?;
+    let shard = client.shard_manager.clone();
+    let bot_task = tokio::spawn(async move {
+        let mut client = client;
+        let _ = client.start().await;
+    });
+
+    let outcome = tokio::task::spawn_blocking(running_loop)
+        .await
+        .unwrap_or(Outcome::Quit);
+
+    shard.shutdown_all().await;
+    bot_task.abort();
+    crate::bot::stop_capture();
+    crate::bot::set_quiet(false);
+    Ok(outcome)
+}
+
+fn running_loop() -> Outcome {
+    let mut terminal = ratatui::init();
+    let out = loop {
+        let _ = terminal.draw(draw_running);
+        if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
+            if let Ok(Event::Key(k)) = event::read() {
+                if k.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match k.code {
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        break Outcome::Quit;
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => break Outcome::Config,
+                    _ => {}
+                }
+            }
+        }
+    };
+    ratatui::restore();
+    out
+}
+
+fn draw_running(f: &mut Frame) {
+    let area = f.area();
+    let chunks = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(4),
+        Constraint::Length(3),
+        Constraint::Min(1),
+    ])
+    .split(area);
+
+    let title =
+        Paragraph::new("🥤 PepsiStreamy — 방송 중").block(Block::default().borders(Borders::ALL));
+    f.render_widget(title, chunks[0]);
+
+    let connected = crate::bot::is_connected();
+    let info = Paragraph::new(vec![
+        Line::from(format!(
+            "연결: {}   청취자: {}명",
+            if connected {
+                "음성채널 연결됨"
+            } else {
+                "대기중 (디스코드에서 /join)"
+            },
+            crate::bot::listeners()
+        )),
+        Line::from(format!("상태: {}", crate::bot::status())),
+    ])
+    .block(Block::default().borders(Borders::ALL).title("상태"))
+    .wrap(Wrap { trim: true });
+    f.render_widget(info, chunks[1]);
+
+    let level = crate::capture::current_level();
+    let db = if level < 1e-4 {
+        -90.0
+    } else {
+        20.0 * level.log10()
+    };
+    let gauge = Gauge::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("입력 레벨 (필터 후)"),
+        )
+        .gauge_style(Style::default().fg(Color::Green))
+        .ratio(level.sqrt().clamp(0.0, 1.0) as f64)
+        .label(format!("{db:.0} dBFS"));
+    f.render_widget(gauge, chunks[2]);
+
+    let help = Paragraph::new(
+        "Esc/q → 설정으로 · Ctrl+C → 완전 종료   |   디스코드: /join  /reload  /leave  /status",
+    )
+    .block(Block::default().borders(Borders::ALL))
+    .wrap(Wrap { trim: true });
+    f.render_widget(help, chunks[3]);
 }

@@ -22,10 +22,7 @@ async fn main() -> Result<()> {
     // 인자 없이 실행 = TUI(설정/인스톨러)
     let arg = std::env::args().nth(1).unwrap_or_else(|| "tui".to_string());
     match arg.as_str() {
-        "tui" | "config" | "setup" => {
-            let start = tui::run()?;
-            if start { bot::run().await } else { Ok(()) }
-        }
+        "tui" | "config" | "setup" => tui_session().await,
         "run" => bot::run().await,
         "devices" => {
             cmd_devices();
@@ -55,6 +52,20 @@ async fn main() -> Result<()> {
             eprintln!("알 수 없는 명령: {other}\n");
             print_help();
             std::process::exit(2);
+        }
+    }
+}
+
+/// 설정 TUI ↔ 봇 실행 화면 루프. config 에서 "봇 실행" 선택 → 실행 화면, Esc 면 설정으로 복귀.
+async fn tui_session() -> Result<()> {
+    loop {
+        let run = tokio::task::spawn_blocking(tui::config).await??;
+        if !run {
+            return Ok(());
+        }
+        match tui::run_bot_screen().await? {
+            tui::Outcome::Config => continue,
+            tui::Outcome::Quit => return Ok(()),
         }
     }
 }

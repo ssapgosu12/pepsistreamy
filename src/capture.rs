@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Read};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -268,10 +268,12 @@ fn run_capture(
     let mut local: VecDeque<u8> = VecDeque::new();
     while !shared.closed.load(Ordering::Acquire) {
         if event.wait_for_event(200).is_err() {
+            decay_level();
             continue; // 무음 구간 타임아웃 → 종료 플래그만 확인하고 계속
         }
         capture_client.read_from_device_to_deque(&mut local)?;
         if local.is_empty() {
+            decay_level();
             continue;
         }
         let mut bytes: Vec<u8> = local.drain(..).collect();
@@ -281,13 +283,47 @@ fn run_capture(
         if let Some(m) = &monitor {
             m.write(&bytes);
         }
+        update_level(&bytes);
         push_bytes(shared, &bytes);
     }
     if let Some(m) = &mut monitor {
         m.stop();
     }
+    LEVEL.store(0, Ordering::Relaxed);
     let _ = audio_client.stop_stream();
     Ok(())
+}
+
+// ---- 라이브 레벨(TUI 볼륨바용 전역) ----
+
+static LEVEL: AtomicU32 = AtomicU32::new(0); // 피크 진폭 ×10000
+
+/// 현재 캡처 피크 레벨(0.0~1.0). 캡처가 없으면 0.
+pub fn current_level() -> f32 {
+    LEVEL.load(Ordering::Relaxed) as f32 / 10000.0
+}
+
+fn update_level(bytes: &[u8]) {
+    let mut peak = 0.0f32;
+    for c in bytes.chunks_exact(4) {
+        let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs();
+        if v > peak {
+            peak = v;
+        }
+    }
+    let cur = LEVEL.load(Ordering::Relaxed) as f32 / 10000.0;
+    // 어택 즉시, 디케이 완만
+    let new = if peak > cur {
+        peak
+    } else {
+        cur * 0.8 + peak * 0.2
+    };
+    LEVEL.store((new.clamp(0.0, 1.0) * 10000.0) as u32, Ordering::Relaxed);
+}
+
+fn decay_level() {
+    let cur = LEVEL.load(Ordering::Relaxed);
+    LEVEL.store((cur as f32 * 0.7) as u32, Ordering::Relaxed);
 }
 
 fn apply_dsp(dsp: &mut DspChain, bytes: &mut [u8]) {

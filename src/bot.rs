@@ -1,8 +1,9 @@
 //! serenity 슬래시 명령 봇 + songbird 음성 송출.
 //!
-//! 설정은 setting.ini(Settings) 우선, 환경변수로 덮어쓸 수 있다. 슬래시 명령만 쓰므로
-//! 특권 인텐트가 필요 없다.
+//! 설정은 매번 setting.ini(Settings::load) 를 새로 읽어 /join·/reload 에 즉시 반영된다.
+//! TUI 실행 화면에서 상태/볼륨을 보여줄 수 있도록 연결상태·청취자수·상태문자열을 전역으로 노출한다.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serenity::all::*;
@@ -12,18 +13,49 @@ use songbird::input::RawAdapter;
 use songbird::input::core::io::ReadOnlySource;
 
 use crate::capture::{self, CaptureHandle, CaptureSource};
+use crate::dsp::DspChain;
 use crate::monitor::MonitorSpec;
 use crate::settings::Settings;
 
 static CAPTURE: OnceLock<Mutex<Option<CaptureHandle>>> = OnceLock::new();
-static SETTINGS: OnceLock<Settings> = OnceLock::new();
+static CONNECTED: AtomicBool = AtomicBool::new(false);
+static LISTENERS: AtomicUsize = AtomicUsize::new(0);
+static QUIET: AtomicBool = AtomicBool::new(false);
+static STATUS: Mutex<String> = Mutex::new(String::new());
 
 fn slot() -> &'static Mutex<Option<CaptureHandle>> {
     CAPTURE.get_or_init(|| Mutex::new(None))
 }
 
-fn settings() -> &'static Settings {
-    SETTINGS.get_or_init(Settings::load)
+// ---- TUI 가 읽는 전역 상태 ----
+pub fn set_quiet(q: bool) {
+    QUIET.store(q, Ordering::Relaxed);
+}
+pub fn is_connected() -> bool {
+    CONNECTED.load(Ordering::Relaxed)
+}
+pub fn listeners() -> usize {
+    LISTENERS.load(Ordering::Relaxed)
+}
+pub fn status() -> String {
+    STATUS.lock().unwrap().clone()
+}
+
+fn set_status(msg: impl Into<String>) {
+    let msg = msg.into();
+    if !QUIET.load(Ordering::Relaxed) {
+        println!("[pepsistreamy] {msg}");
+    }
+    *STATUS.lock().unwrap() = msg;
+}
+
+/// 캡처 중지 + 상태 초기화(연결 종료 시).
+pub fn stop_capture() {
+    if let Some(mut h) = slot().lock().unwrap().take() {
+        h.stop();
+    }
+    CONNECTED.store(false, Ordering::Relaxed);
+    LISTENERS.store(0, Ordering::Relaxed);
 }
 
 struct Handler {
@@ -36,6 +68,7 @@ impl EventHandler for Handler {
         let cmds = vec![
             CreateCommand::new("join").description("내가 있는 음성 채널로 들어가 방송 시작"),
             CreateCommand::new("leave").description("방송 종료 후 음성 채널에서 나가기"),
+            CreateCommand::new("reload").description("setting.ini 의 소스/DSP/모니터를 다시 적용"),
             CreateCommand::new("status").description("캡처/연결 상태 보기"),
         ];
         let res = if let Some(gid) = self.guild_id {
@@ -51,12 +84,11 @@ impl EventHandler for Handler {
         if let Err(e) = res {
             eprintln!("[pepsistreamy] 슬래시 명령 등록 실패: {e}");
         }
-        println!(
-            "[pepsistreamy] 로그인됨: {} (서버 {}개)",
+        set_status(format!(
+            "로그인됨: {} (서버 {}개). 음성채널 입장 후 /join",
             ready.user.name,
             ready.guilds.len()
-        );
-        println!("[pepsistreamy] 디스코드에서 음성 채널 입장 후 /join 입력하세요.");
+        ));
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
@@ -66,6 +98,7 @@ impl EventHandler for Handler {
         let content = match command.data.name.as_str() {
             "join" => handle_join(&ctx, &command).await,
             "leave" => handle_leave(&ctx, &command).await,
+            "reload" => handle_reload(&ctx, &command).await,
             "status" => handle_status(&ctx, &command).await,
             other => format!("알 수 없는 명령: {other}"),
         };
@@ -80,35 +113,33 @@ impl EventHandler for Handler {
         }
     }
 
-    /// 음성 상태가 바뀔 때마다, 봇이 있는 채널에 사람(봇 제외)이 0명이면 자동 퇴장.
+    /// 음성 상태 변경마다 청취자 수 갱신 + 봇 혼자면 자동 퇴장.
     async fn voice_state_update(&self, ctx: Context, _old: Option<VoiceState>, new: VoiceState) {
         let Some(guild_id) = new.guild_id else {
             return;
         };
         let bot_id = ctx.cache.current_user().id;
-        let alone = {
+        let count = {
             let Some(guild) = ctx.cache.guild(guild_id) else {
                 return;
             };
             let Some(bot_ch) = guild.voice_states.get(&bot_id).and_then(|vs| vs.channel_id) else {
+                LISTENERS.store(0, Ordering::Relaxed);
                 return; // 봇이 음성채널에 없음
             };
-            // 봇 채널의 사람 수(봇 제외)가 0인가
             guild
                 .voice_states
                 .values()
                 .filter(|vs| vs.channel_id == Some(bot_ch) && vs.user_id != bot_id)
                 .count()
-                == 0
         };
-        if alone {
-            if let Some(mut h) = slot().lock().unwrap().take() {
-                h.stop();
-            }
+        LISTENERS.store(count, Ordering::Relaxed);
+        if count == 0 {
+            stop_capture();
             if let Some(m) = songbird::get(&ctx).await {
                 let _ = m.remove(guild_id).await;
             }
-            println!("[pepsistreamy] 채널에 아무도 없어 자동 퇴장했습니다.");
+            set_status("채널에 아무도 없어 자동 퇴장했습니다.");
         }
     }
 }
@@ -120,27 +151,49 @@ fn env_set(key: &str) -> bool {
         .is_some()
 }
 
-fn build_source() -> anyhow::Result<CaptureSource> {
-    if env_set("YTCAST_PROCESS") || env_set("YTCAST_DEVICE") {
-        CaptureSource::from_env()
+/// setting.ini(또는 env) 를 새로 읽어 (소스, DSP, 모니터) 구성.
+fn build_config() -> anyhow::Result<(CaptureSource, Option<DspChain>, Option<MonitorSpec>)> {
+    let s = Settings::load();
+    let sr = capture::SAMPLE_RATE as f32;
+    let source = if env_set("YTCAST_PROCESS") || env_set("YTCAST_DEVICE") {
+        CaptureSource::from_env()?
     } else {
-        settings().capture_source()
-    }
-}
-
-fn build_dsp() -> Option<crate::dsp::DspChain> {
-    if env_set("YTCAST_DSP") {
-        crate::dsp::DspChain::from_env(capture::SAMPLE_RATE as f32)
+        s.capture_source()?
+    };
+    let dsp = if env_set("YTCAST_DSP") {
+        DspChain::from_env(sr)
     } else {
-        settings().dsp_chain(capture::SAMPLE_RATE as f32)
-    }
-}
-
-fn build_monitor() -> Option<MonitorSpec> {
-    let s = settings();
-    s.monitor.then(|| MonitorSpec {
+        s.dsp_chain(sr)
+    };
+    let monitor = s.monitor.then(|| MonitorSpec {
         device: s.monitor_device.clone(),
-    })
+    });
+    Ok((source, dsp, monitor))
+}
+
+/// 캡처를 (재)시작해 주어진 Call 에 송출한다.
+async fn apply_capture(
+    call: &std::sync::Arc<serenity::prelude::Mutex<songbird::Call>>,
+) -> Result<(), String> {
+    let (source, dsp, monitor) = build_config().map_err(|e| format!("설정 오류: {e}"))?;
+    let (handle, reader) =
+        capture::start(source, dsp, monitor).map_err(|e| format!("캡처 시작 실패: {e}"))?;
+    {
+        let mut g = slot().lock().unwrap();
+        if let Some(mut old) = g.take() {
+            old.stop();
+        }
+        *g = Some(handle);
+    }
+    let src = RawAdapter::new(
+        ReadOnlySource::new(reader),
+        capture::SAMPLE_RATE,
+        capture::CHANNELS,
+    );
+    let mut h = call.lock().await;
+    h.stop();
+    h.play_input(src.into());
+    Ok(())
 }
 
 async fn handle_join(ctx: &Context, command: &CommandInteraction) -> String {
@@ -160,76 +213,55 @@ async fn handle_join(ctx: &Context, command: &CommandInteraction) -> String {
         return "먼저 음성 채널에 들어간 다음 다시 `/join` 하세요.".to_string();
     };
 
-    let source = match build_source() {
-        Ok(s) => s,
-        Err(e) => return format!("캡처 소스 결정 실패: {e}"),
-    };
-    let dsp = build_dsp();
-    let monitor = build_monitor();
-    let (handle, reader) = match capture::start(source, dsp, monitor) {
-        Ok(v) => v,
-        Err(e) => return format!("캡처 시작 실패: {e}"),
-    };
-    {
-        let mut g = slot().lock().unwrap();
-        if let Some(mut old) = g.take() {
-            old.stop();
-        }
-        *g = Some(handle);
-    }
-
     let manager = match songbird::get(ctx).await {
         Some(m) => m.clone(),
         None => return "songbird 초기화 안 됨".to_string(),
     };
     let call = match manager.join(guild_id, channel_id).await {
         Ok(c) => c,
-        Err(e) => {
-            if let Some(mut h) = slot().lock().unwrap().take() {
-                h.stop();
-            }
-            return format!("음성 채널 입장 실패: {e}");
-        }
+        Err(e) => return format!("음성 채널 입장 실패: {e}"),
     };
-    let src = RawAdapter::new(
-        ReadOnlySource::new(reader),
-        capture::SAMPLE_RATE,
-        capture::CHANNELS,
-    );
-    {
-        let mut handler = call.lock().await;
-        handler.stop();
-        handler.play_input(src.into());
+    if let Err(e) = apply_capture(&call).await {
+        stop_capture();
+        let _ = manager.remove(guild_id).await;
+        return e;
     }
+    CONNECTED.store(true, Ordering::Relaxed);
+    set_status("방송 시작");
     "▶️ 방송 시작. 브라우저/앱에서 소리를 재생하세요.".to_string()
+}
+
+async fn handle_reload(ctx: &Context, command: &CommandInteraction) -> String {
+    let Some(guild_id) = command.guild_id else {
+        return "서버 안에서만 사용할 수 있습니다.".to_string();
+    };
+    let manager = match songbird::get(ctx).await {
+        Some(m) => m.clone(),
+        None => return "songbird 초기화 안 됨".to_string(),
+    };
+    let call = match manager.get(guild_id) {
+        Some(c) => c,
+        None => return "연결돼 있지 않습니다. 먼저 `/join` 하세요.".to_string(),
+    };
+    match apply_capture(&call).await {
+        Ok(_) => "🔄 설정을 다시 적용했습니다(소스/DSP/모니터).".to_string(),
+        Err(e) => e,
+    }
 }
 
 async fn handle_leave(ctx: &Context, command: &CommandInteraction) -> String {
     let Some(guild_id) = command.guild_id else {
         return "서버 안에서만 사용할 수 있습니다.".to_string();
     };
-    if let Some(mut h) = slot().lock().unwrap().take() {
-        h.stop();
-    }
+    stop_capture();
     if let Some(manager) = songbird::get(ctx).await {
         let _ = manager.remove(guild_id).await;
     }
+    set_status("방송 종료, 채널에서 나감");
     "⏹️ 방송 종료, 채널에서 나갔습니다.".to_string()
 }
 
-async fn handle_status(ctx: &Context, command: &CommandInteraction) -> String {
-    let connected = match command.guild_id {
-        Some(gid) => match songbird::get(ctx).await {
-            Some(m) => m.get(gid).is_some(),
-            None => false,
-        },
-        None => false,
-    };
-    let conn = if connected {
-        "음성채널 연결됨"
-    } else {
-        "미연결"
-    };
+async fn handle_status(_ctx: &Context, _command: &CommandInteraction) -> String {
     let g = slot().lock().unwrap();
     match g.as_ref() {
         Some(h) => {
@@ -238,7 +270,13 @@ async fn handle_status(ctx: &Context, command: &CommandInteraction) -> String {
                 .map(|e| format!(" (오류: {e})"))
                 .unwrap_or_default();
             format!(
-                "```\n캡처: 동작중{err}\n연결: {conn}\n소스: {}\nDSP: {}\n바이트: 캡처 {} / 드롭 {} / 버퍼 {}\n```",
+                "```\n캡처: 동작중{err}\n연결: {}\n청취자: {}명\n소스: {}\nDSP: {}\n바이트: 캡처 {} / 드롭 {} / 버퍼 {}\n```",
+                if is_connected() {
+                    "연결됨"
+                } else {
+                    "미연결"
+                },
+                listeners(),
                 h.source_label(),
                 h.dsp_label().unwrap_or("off"),
                 h.captured_bytes(),
@@ -246,13 +284,21 @@ async fn handle_status(ctx: &Context, command: &CommandInteraction) -> String {
                 h.buffered_bytes(),
             )
         }
-        None => format!("```\n캡처: 중지\n연결: {conn}\n```"),
+        None => format!(
+            "```\n캡처: 중지\n연결: {}\n```",
+            if is_connected() {
+                "연결됨"
+            } else {
+                "미연결"
+            }
+        ),
     }
 }
 
-pub async fn run() -> anyhow::Result<()> {
+/// setting.ini(또는 env) 에서 토큰·길드ID 가져오기.
+pub fn token_and_guild() -> anyhow::Result<(String, Option<u64>)> {
     dotenvy::dotenv().ok();
-    let s = settings();
+    let s = Settings::load();
     let token = s
         .token()
         .or_else(|| {
@@ -270,21 +316,29 @@ pub async fn run() -> anyhow::Result<()> {
             .ok()
             .and_then(|v| v.trim().parse().ok())
     });
+    Ok((token, guild_id))
+}
 
+/// serenity 클라이언트 빌드(시작은 호출자가). TUI 실행 화면에서 사용.
+pub async fn build_client(token: &str, guild_id: Option<u64>) -> anyhow::Result<Client> {
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
-    let mut client = Client::builder(&token, intents)
+    let client = Client::builder(token, intents)
         .event_handler(Handler { guild_id })
         .register_songbird()
         .await?;
+    Ok(client)
+}
 
+/// 콘솔 모드 실행(`run` 명령). Ctrl+C 로 종료.
+pub async fn run() -> anyhow::Result<()> {
+    set_quiet(false);
+    let (token, guild_id) = token_and_guild()?;
+    let mut client = build_client(&token, guild_id).await?;
     println!("[pepsistreamy] 봇 시작 중... (Ctrl+C 로 종료)");
     tokio::select! {
         r = client.start() => { r?; }
         _ = tokio::signal::ctrl_c() => { println!("\n[pepsistreamy] 종료합니다."); }
     }
-
-    if let Some(mut h) = slot().lock().unwrap().take() {
-        h.stop();
-    }
+    stop_capture();
     Ok(())
 }
