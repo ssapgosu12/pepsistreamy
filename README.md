@@ -5,7 +5,7 @@
 
 > 포트포워딩도, 빌리는 서버도 필요 없습니다. 봇이 디스코드로 *바깥으로* 접속(outbound)하기 때문입니다.
 
-> 🦀 **네이티브(Rust) 버전이 있습니다.** 파이썬 설치 없이 **단일 실행파일(~16MB)** 로 쓰려면 [`rust/`](rust/) 폴더와 [Releases](https://github.com/ssapgosu12/pepsistreamy/releases) 의 `pepsistreamy.exe` 를 보세요. 친구에게는 exe 하나만 주면 됩니다. 더해서 **특정 앱만 캡처(프로세스 루프백)**, **내장 DSP(HP/LP+리버브)**, **설정 마법사(`setup`)** 까지 들어 있습니다 — [rust/README](rust/README.md) 참고.
+> 🦀 **네이티브(Rust) 버전이 더 강력합니다.** 파이썬 없이 **단일 실행파일(~16MB)** — [`rust/`](rust/) 와 [Releases](https://github.com/ssapgosu12/pepsistreamy/releases)의 `pepsistreamy.exe`. 인자 없이 실행하면 **방향키 설정 TUI**가 열립니다. 추가 기능: **특정 앱만 캡처(프로세스 루프백)**, **내장 DSP(HP/LP+리버브, 프로필 저장)**, **로컬 모니터(송출자도 필터본 청취)**, **토큰 DPAPI 암호화**(setting.ini 공유해도 토큰은 안전). 자세한 건 [rust/README](rust/README.md).
 
 ```
  [ 내 PC (Windows) ]

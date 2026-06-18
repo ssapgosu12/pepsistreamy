@@ -14,6 +14,55 @@
 
 use std::f32::consts::PI;
 
+/// DSP 파라미터(각 0~100 노브값). TUI/프로필이 이 값을 다룬다.
+#[derive(Clone, Copy, PartialEq)]
+pub struct DspParams {
+    pub high_freq: u8, // highpass 컷오프
+    pub high_res: u8,  // highpass Q(레조넌스)
+    pub low_freq: u8,  // lowpass 컷오프
+    pub low_res: u8,   // lowpass Q
+    pub room: u8,      // 리버브 룸사이즈
+    pub mix: u8,       // 리버브 wet(섞임)
+}
+
+impl Default for DspParams {
+    fn default() -> Self {
+        DspParams {
+            high_freq: 10,
+            high_res: 40,
+            low_freq: 53,
+            low_res: 10,
+            room: 60,
+            mix: 25,
+        }
+    }
+}
+
+impl DspParams {
+    // 0~100 → 실제 값 매핑 (주파수는 로그 스케일)
+    pub fn hp_hz(&self) -> f32 {
+        20.0 * 100f32.powf(self.high_freq as f32 / 100.0) // 20Hz~2kHz
+    }
+    pub fn lp_hz(&self) -> f32 {
+        200.0 * 90f32.powf(self.low_freq as f32 / 100.0) // 200Hz~18kHz
+    }
+    fn map_q(v: u8) -> f32 {
+        0.5 + (v as f32 / 100.0) * 5.5 // 0.5 ~ 6.0
+    }
+    pub fn hp_q(&self) -> f32 {
+        Self::map_q(self.high_res)
+    }
+    pub fn lp_q(&self) -> f32 {
+        Self::map_q(self.low_res)
+    }
+    pub fn room01(&self) -> f32 {
+        self.room as f32 / 100.0
+    }
+    pub fn mix01(&self) -> f32 {
+        self.mix as f32 / 100.0
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Biquad {
     b0: f32,
@@ -222,6 +271,44 @@ pub struct DspChain {
 impl DspChain {
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// 0~100 노브 파라미터로 체인 구성.
+    pub fn from_params(fs: f32, p: &DspParams) -> DspChain {
+        let hp_hz = p.hp_hz();
+        let hp_q = p.hp_q();
+        let hp = (p.high_freq > 0).then(|| {
+            [
+                Biquad::highpass(fs, hp_hz, hp_q),
+                Biquad::highpass(fs, hp_hz, hp_q),
+            ]
+        });
+        let lp_hz = p.lp_hz();
+        let lp_q = p.lp_q();
+        let lp = (p.low_freq < 100 && lp_hz < fs / 2.0).then(|| {
+            [
+                Biquad::lowpass(fs, lp_hz, lp_q),
+                Biquad::lowpass(fs, lp_hz, lp_q),
+            ]
+        });
+        let mix = p.mix01();
+        let reverb = (mix > 0.0).then(|| Reverb::new(fs, mix, p.room01(), 0.5));
+        let label = format!(
+            "HP {:.0}Hz(Q{:.1}) / LP {:.0}Hz(Q{:.1}) / reverb {:.2}(room {:.2})",
+            hp_hz,
+            hp_q,
+            lp_hz,
+            lp_q,
+            mix,
+            p.room01(),
+        );
+        DspChain {
+            hp,
+            lp,
+            reverb,
+            gain: 1.0,
+            label,
+        }
     }
 
     /// 48k 스테레오 f32 인터리브 in-place 처리.

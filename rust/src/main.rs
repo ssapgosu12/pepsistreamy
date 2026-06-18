@@ -5,18 +5,27 @@
 //!   devices   캡처 가능한 출력장치 목록
 //!   doctor    환경 점검
 
+mod b64;
 mod bot;
 mod capture;
 mod dsp;
+mod monitor;
 mod process;
+mod settings;
 mod setup;
+mod tui;
 
 use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let arg = std::env::args().nth(1).unwrap_or_else(|| "run".to_string());
+    // 인자 없이 실행 = TUI(설정/인스톨러)
+    let arg = std::env::args().nth(1).unwrap_or_else(|| "tui".to_string());
     match arg.as_str() {
+        "tui" | "config" | "setup" => {
+            let start = tui::run()?;
+            if start { bot::run().await } else { Ok(()) }
+        }
         "run" => bot::run().await,
         "devices" => {
             cmd_devices();
@@ -26,7 +35,6 @@ async fn main() -> Result<()> {
             cmd_processes();
             Ok(())
         }
-        "setup" => setup::run_wizard(),
         "doctor" => {
             cmd_doctor();
             Ok(())
@@ -53,20 +61,17 @@ async fn main() -> Result<()> {
 
 fn print_help() {
     println!("pepsistreamy — 내 PC 소리를 디스코드 음성 채널로 방송\n");
-    println!("사용법: pepsistreamy <명령>");
-    println!("  setup     설정 마법사(봇 토큰 입력·초대링크·VB-CABLE 안내)");
-    println!("  run       캡처 + 봇 실행 (기본값)");
-    println!("  devices   캡처 가능한 출력장치(스피커) 목록");
-    println!("  processes 실행 중 프로세스 목록(특정 앱 캡처용 PID 확인)");
-    println!("  meter     선택 소스의 캡처 레벨 확인 (예: meter 10)");
-    println!("  doctor    환경 점검");
-    println!("\n설정(.env):");
-    println!("  DISCORD_TOKEN(필수), DISCORD_GUILD_ID(선택)");
-    println!("  YTCAST_PROCESS  특정 앱만 캡처(PID 또는 프로세스명). 비우면 장치 캡처.");
-    println!("  YTCAST_DEVICE   특정 출력장치 캡처(이름 일부). 비우면 기본 스피커.");
+    println!("사용법: pepsistreamy [명령]   (명령 없이 실행하면 설정 TUI 가 열립니다)");
+    println!("  (없음)/tui  설정 TUI — 토큰(암호화 저장)·소스·DSP·모니터를 방향키로 설정");
+    println!("  run         캡처 + 봇 실행 (setting.ini 사용)");
+    println!("  devices     캡처 가능한 출력장치(스피커) 목록");
+    println!("  processes   실행 중 프로세스 목록(특정 앱 캡처용 PID 확인)");
+    println!("  meter       선택 소스의 캡처 레벨 확인 (예: meter 10)");
+    println!("  doctor      환경 점검");
     println!(
-        "  YTCAST_DSP      off|on|ambient  내장 필터(HP/LP+reverb). 세부: YTCAST_HP/LP/REVERB/ROOM/GAIN"
+        "\n설정은 setting.ini 에 저장됩니다(토큰은 DPAPI 암호화). 환경변수로도 덮어쓸 수 있습니다:"
     );
+    println!("  DISCORD_TOKEN / DISCORD_GUILD_ID / YTCAST_PROCESS / YTCAST_DEVICE / YTCAST_DSP 등");
 }
 
 fn cmd_devices() {
@@ -113,7 +118,7 @@ fn cmd_meter(seconds: f64) {
         }
     };
     let dsp = dsp::DspChain::from_env(capture::SAMPLE_RATE as f32);
-    let (mut handle, mut reader) = match capture::start(source, dsp) {
+    let (mut handle, mut reader) = match capture::start(source, dsp, None) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("캡처 시작 실패: {e}");
@@ -185,20 +190,31 @@ fn cmd_meter(seconds: f64) {
 fn cmd_doctor() {
     println!("pepsistreamy 환경 점검");
     dotenvy::dotenv().ok();
-    let token = std::env::var("DISCORD_TOKEN")
-        .ok()
-        .filter(|s| !s.is_empty());
+    let s = settings::Settings::load();
+    let has_token = s.token().is_some()
+        || std::env::var("DISCORD_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty())
+            .is_some();
     println!(
-        "  [{}] DISCORD_TOKEN 설정됨",
-        if token.is_some() { "OK" } else { "X " }
+        "  [{}] 토큰 (setting.ini 암호화 또는 env)",
+        if has_token { "OK" } else { "X " }
     );
     match capture::default_render_name() {
         Ok(n) => println!("  [OK] 기본 출력장치: {n}"),
         Err(e) => println!("  [X ] 출력장치 조회 실패: {e}"),
     }
+    println!(
+        "  [..] DSP: {}",
+        if s.dsp_enabled { "켜짐" } else { "꺼짐" }
+    );
+    println!(
+        "  [..] 로컬 모니터: {}",
+        if s.monitor { "켜짐" } else { "꺼짐" }
+    );
     println!("  [OK] 버전: pepsistreamy {}", env!("CARGO_PKG_VERSION"));
-    if token.is_none() {
-        println!("\n.env 에 DISCORD_TOKEN=... 추가 후  `pepsistreamy run`");
+    if !has_token {
+        println!("\n인자 없이 `pepsistreamy` 를 실행해 설정 TUI 에서 토큰을 넣으세요.");
     } else {
         println!("\n준비 완료 —  `pepsistreamy run`");
     }

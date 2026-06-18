@@ -169,6 +169,7 @@ impl CaptureHandle {
 pub fn start(
     source: CaptureSource,
     dsp: Option<DspChain>,
+    monitor: Option<crate::monitor::MonitorSpec>,
 ) -> Result<(CaptureHandle, CaptureReader)> {
     let shared = Arc::new(Shared::new());
     let source_label = source.label();
@@ -179,7 +180,7 @@ pub fn start(
     let join = thread::Builder::new()
         .name("pepsi-capture".into())
         .spawn(move || {
-            if let Err(e) = run_capture(&sh, source, dsp, &tx) {
+            if let Err(e) = run_capture(&sh, source, dsp, monitor, &tx) {
                 let msg = e.to_string();
                 *sh.error.lock().unwrap() = Some(msg.clone());
                 let _ = tx.send(Err(msg));
@@ -205,6 +206,7 @@ fn run_capture(
     shared: &Arc<Shared>,
     source: CaptureSource,
     mut dsp: Option<DspChain>,
+    monitor_spec: Option<crate::monitor::MonitorSpec>,
     tx: &Sender<Result<(), String>>,
 ) -> Result<()> {
     let _ = wasapi::initialize_mta();
@@ -251,6 +253,18 @@ fn run_capture(
 
     let _ = tx.send(Ok(())); // 초기화 성공 통보
 
+    // 모니터(선택): 처리된 소리를 출력장치로도 재생. 실패해도 캡처는 계속.
+    let mut monitor = match monitor_spec {
+        Some(spec) => match crate::monitor::Monitor::start(spec) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("[pepsistreamy] 모니터 시작 실패(무시): {e}");
+                None
+            }
+        },
+        None => None,
+    };
+
     let mut local: VecDeque<u8> = VecDeque::new();
     while !shared.closed.load(Ordering::Acquire) {
         if event.wait_for_event(200).is_err() {
@@ -264,7 +278,13 @@ fn run_capture(
         if let Some(dsp) = &mut dsp {
             apply_dsp(dsp, &mut bytes);
         }
+        if let Some(m) = &monitor {
+            m.write(&bytes);
+        }
         push_bytes(shared, &bytes);
+    }
+    if let Some(m) = &mut monitor {
+        m.stop();
     }
     let _ = audio_client.stop_stream();
     Ok(())
@@ -294,7 +314,7 @@ fn push_bytes(shared: &Arc<Shared>, bytes: &[u8]) {
     }
 }
 
-fn find_render_device(name: &str) -> Result<Device> {
+pub(crate) fn find_render_device(name: &str) -> Result<Device> {
     let coll = DeviceEnumerator::new()?.get_device_collection(&Direction::Render)?;
     let n = coll.get_nbr_devices()?;
     let want = name.to_lowercase();
