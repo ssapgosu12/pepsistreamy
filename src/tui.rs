@@ -61,9 +61,10 @@ enum Screen {
 struct App {
     s: Settings,
     screen: Screen,
-    sel: usize,         // 현재 화면의 리스트/항목 선택 인덱스
-    items: Vec<String>, // 동적 리스트(장치/프로세스/프로필)
-    input: String,      // 토큰/프로필명 입력
+    sel: usize,          // 현재 화면의 리스트/항목 선택 인덱스
+    items: Vec<String>,  // 표시용 리스트(장치/프로세스/프로필)
+    values: Vec<String>, // 항목별 실제 값(프로세스는 이름만 저장)
+    input: String,       // 토큰/프로필명 입력
     msg: String,
     start_bot: bool,
     quit: bool,
@@ -75,6 +76,7 @@ pub fn run() -> Result<bool> {
         screen: Screen::Menu,
         sel: 0,
         items: Vec::new(),
+        values: Vec::new(),
         input: String::new(),
         msg: String::new(),
         start_bot: false,
@@ -187,6 +189,7 @@ impl App {
             }
             (Screen::Dsp, 'l') | (Screen::Dsp, 'L') => {
                 self.items = self.s.profiles.keys().cloned().collect();
+                self.values = self.items.clone();
                 self.sel = 0;
                 self.screen = Screen::ProfileList;
                 if self.items.is_empty() {
@@ -214,23 +217,21 @@ impl App {
             Screen::Menu => self.menu_enter(),
             Screen::SourceKind => self.source_kind_enter(),
             Screen::DevicePick => {
-                if let Some(name) = self.items.get(self.sel).cloned() {
+                if let Some(name) = self.values.get(self.sel).cloned() {
                     self.s.source = SourceSel::Device(name);
                     self.msg = "출력장치 캡처로 설정.".into();
                     self.back_to_menu();
                 }
             }
             Screen::ProcessPick => {
-                if let Some(item) = self.items.get(self.sel).cloned() {
-                    // "PID  이름" 형식 → PID 추출
-                    let pid = item.split_whitespace().next().unwrap_or("").to_string();
-                    self.s.source = SourceSel::Process(pid);
-                    self.msg = format!("프로세스 캡처로 설정: {item}");
+                if let Some(name) = self.values.get(self.sel).cloned() {
+                    self.s.source = SourceSel::Process(name.clone());
+                    self.msg = format!("프로세스 '{name}' 캡처로 설정(실행 시 루트 자동 선택).");
                     self.back_to_menu();
                 }
             }
             Screen::ProfileList => {
-                if let Some(name) = self.items.get(self.sel).cloned() {
+                if let Some(name) = self.values.get(self.sel).cloned() {
                     if let Some(p) = self.s.profiles.get(&name).copied() {
                         self.s.dsp = p;
                         self.s.dsp_enabled = true;
@@ -252,12 +253,13 @@ impl App {
                     self.items = std::iter::once("(기본 출력장치)".to_string())
                         .chain(crate::capture::list_render_devices().unwrap_or_default())
                         .collect();
+                    self.values = self.items.clone();
                     self.sel = 0;
                     self.screen = Screen::MonitorDevicePick;
                 }
             }
             Screen::MonitorDevicePick => {
-                if let Some(name) = self.items.get(self.sel).cloned() {
+                if let Some(name) = self.values.get(self.sel).cloned() {
                     self.s.monitor_device = if self.sel == 0 { None } else { Some(name) };
                     self.screen = Screen::Monitor;
                     self.sel = 0;
@@ -313,14 +315,24 @@ impl App {
             }
             1 => {
                 self.items = crate::capture::list_render_devices().unwrap_or_default();
+                self.values = self.items.clone();
                 self.sel = 0;
                 self.screen = Screen::DevicePick;
             }
             2 => {
-                self.items = crate::process::list()
-                    .into_iter()
-                    .map(|(pid, name)| format!("{pid:>8}  {name}"))
+                // 이름별로 묶어서 표시(같은 앱 한 줄). 값은 이름 → 실행 시 루트 자동 선택.
+                let named = crate::process::list_named();
+                self.items = named
+                    .iter()
+                    .map(|(name, n)| {
+                        if *n > 1 {
+                            format!("{name}  ({n}개)")
+                        } else {
+                            name.clone()
+                        }
+                    })
                     .collect();
+                self.values = named.into_iter().map(|(name, _)| name).collect();
                 self.sel = 0;
                 self.screen = Screen::ProcessPick;
             }

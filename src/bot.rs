@@ -79,6 +79,38 @@ impl EventHandler for Handler {
             eprintln!("[pepsistreamy] 응답 실패: {e}");
         }
     }
+
+    /// 음성 상태가 바뀔 때마다, 봇이 있는 채널에 사람(봇 제외)이 0명이면 자동 퇴장.
+    async fn voice_state_update(&self, ctx: Context, _old: Option<VoiceState>, new: VoiceState) {
+        let Some(guild_id) = new.guild_id else {
+            return;
+        };
+        let bot_id = ctx.cache.current_user().id;
+        let alone = {
+            let Some(guild) = ctx.cache.guild(guild_id) else {
+                return;
+            };
+            let Some(bot_ch) = guild.voice_states.get(&bot_id).and_then(|vs| vs.channel_id) else {
+                return; // 봇이 음성채널에 없음
+            };
+            // 봇 채널의 사람 수(봇 제외)가 0인가
+            guild
+                .voice_states
+                .values()
+                .filter(|vs| vs.channel_id == Some(bot_ch) && vs.user_id != bot_id)
+                .count()
+                == 0
+        };
+        if alone {
+            if let Some(mut h) = slot().lock().unwrap().take() {
+                h.stop();
+            }
+            if let Some(m) = songbird::get(&ctx).await {
+                let _ = m.remove(guild_id).await;
+            }
+            println!("[pepsistreamy] 채널에 아무도 없어 자동 퇴장했습니다.");
+        }
+    }
 }
 
 fn env_set(key: &str) -> bool {

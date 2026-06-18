@@ -34,6 +34,17 @@ pub fn list() -> Vec<(u32, String)> {
     v
 }
 
+/// 이름별로 묶은 (이름, 개수) — 이름 오름차순. 같은 앱(예: chrome.exe 탭 다수)이 한 줄로.
+pub fn list_named() -> Vec<(String, usize)> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (_, name) in list() {
+        *counts.entry(name).or_insert(0) += 1;
+    }
+    let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+    v.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    v
+}
+
 /// PID(숫자) 또는 프로세스명(부분일치) → 캡처할 PID.
 /// 이름이 여러 개면 "루트"(부모가 같은 이름 집합 밖) 프로세스를 고른다 — 브라우저처럼
 /// 오디오를 자식(오디오 서비스) 프로세스에서 내는 경우 루트+트리포함으로 잡기 위함.

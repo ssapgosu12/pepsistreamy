@@ -7,11 +7,27 @@ pub const VBCABLE_URL: &str = "https://vb-audio.com/Cable/";
 // Connect(0x100000) + Speak(0x200000) + View Channels(0x400) = 3146752
 const INVITE_PERMS: u64 = 3_146_752;
 
-/// 기본 브라우저로 URL 열기.
+/// 기본 브라우저로 URL 열기. ShellExecuteW 사용 — cmd 를 거치지 않아 URL 안의 `&` 가
+/// 명령 구분자로 오해되지 않는다.
 pub fn open_url(url: &str) {
-    let _ = std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn();
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    let wide = |s: &str| {
+        s.encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let op = wide("open");
+    let file = wide(url);
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1, // SW_SHOWNORMAL
+        );
+    }
 }
 
 pub fn invite_url(client_id: &str) -> String {
