@@ -7,9 +7,9 @@ use std::sync::{Mutex, OnceLock};
 
 use serenity::all::*;
 use serenity::async_trait;
-use songbird::input::core::io::ReadOnlySource;
-use songbird::input::RawAdapter;
 use songbird::SerenityInit;
+use songbird::input::RawAdapter;
+use songbird::input::core::io::ReadOnlySource;
 
 use crate::capture::{self, CaptureHandle};
 
@@ -27,15 +27,21 @@ struct Handler {
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         let cmds = vec![
-            CreateCommand::new("join").description("내가 있는 음성 채널로 들어가 유튜브 소리 방송 시작"),
+            CreateCommand::new("join")
+                .description("내가 있는 음성 채널로 들어가 유튜브 소리 방송 시작"),
             CreateCommand::new("leave").description("방송 종료 후 음성 채널에서 나가기"),
             CreateCommand::new("status").description("캡처/연결 상태 보기"),
         ];
         let res = if let Some(gid) = self.guild_id {
             // 길드 지정 시 즉시 동기화(전역 동기화는 최대 1시간)
-            GuildId::new(gid).set_commands(&ctx.http, cmds).await.map(|_| ())
+            GuildId::new(gid)
+                .set_commands(&ctx.http, cmds)
+                .await
+                .map(|_| ())
         } else {
-            Command::set_global_commands(&ctx.http, cmds).await.map(|_| ())
+            Command::set_global_commands(&ctx.http, cmds)
+                .await
+                .map(|_| ())
         };
         if let Err(e) = res {
             eprintln!("[pepsistreamy] 슬래시 명령 등록 실패: {e}");
@@ -89,9 +95,13 @@ async fn handle_join(ctx: &Context, command: &CommandInteraction) -> String {
         return "먼저 음성 채널에 들어간 다음 다시 `/join` 하세요.".to_string();
     };
 
-    // 캡처 시작
-    let device = std::env::var("YTCAST_DEVICE").ok().filter(|s| !s.is_empty());
-    let (handle, reader) = match capture::start(device) {
+    // 캡처 시작 (소스: env YTCAST_PROCESS > YTCAST_DEVICE > 기본, DSP: env YTCAST_DSP)
+    let source = match capture::CaptureSource::from_env() {
+        Ok(s) => s,
+        Err(e) => return format!("캡처 소스 결정 실패: {e}"),
+    };
+    let dsp = crate::dsp::DspChain::from_env(capture::SAMPLE_RATE as f32);
+    let (handle, reader) = match capture::start(source, dsp) {
         Ok(v) => v,
         Err(e) => return format!("캡처 시작 실패: {e}"),
     };
@@ -151,7 +161,11 @@ async fn handle_status(ctx: &Context, command: &CommandInteraction) -> String {
         },
         None => false,
     };
-    let conn = if connected { "음성채널 연결됨" } else { "미연결" };
+    let conn = if connected {
+        "음성채널 연결됨"
+    } else {
+        "미연결"
+    };
 
     let g = slot().lock().unwrap();
     match g.as_ref() {
@@ -161,8 +175,9 @@ async fn handle_status(ctx: &Context, command: &CommandInteraction) -> String {
                 .map(|e| format!(" (오류: {e})"))
                 .unwrap_or_default();
             format!(
-                "```\n캡처: 동작중{err}\n연결: {conn}\n장치: {}\n바이트: 캡처 {} / 드롭 {} / 버퍼 {}\n```",
-                h.device_label(),
+                "```\n캡처: 동작중{err}\n연결: {conn}\n소스: {}\nDSP: {}\n바이트: 캡처 {} / 드롭 {} / 버퍼 {}\n```",
+                h.source_label(),
+                h.dsp_label().unwrap_or("off"),
                 h.captured_bytes(),
                 h.dropped_bytes(),
                 h.buffered_bytes(),

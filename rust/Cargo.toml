@@ -1,6 +1,6 @@
 [package]
 name = "pepsistreamy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "내 PC 소리(유튜브 등)를 디스코드 음성 채널로 실시간 방송하는 네이티브 CLI"
 license = "MIT"
@@ -11,6 +11,7 @@ anyhow = "1.0.102"
 dotenvy = "0.15.7"
 serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "cache"] }
 songbird = "0.6.0"
+sysinfo = { version = "0.39.3", default-features = false, features = ["system"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "signal"] }
 wasapi = "0.23.0"
 

@@ -1,30 +1,78 @@
-//! WASAPI 루프백 캡처.
+//! WASAPI 루프백 캡처 (장치 전체 믹스 또는 특정 프로세스).
 //!
-//! 출력장치(스피커)로 나가는 최종 믹스를 그대로 잡는다 — 창의 상태(최소화/백그라운드)와
-//! 무관하다. `autoconvert: true` 로 장치 native 포맷을 48kHz·스테레오·f32 로 자동 변환하므로
-//! 캡처 결과를 그대로 songbird RawAdapter(f32 인터리브)에 흘릴 수 있다.
+//! - 기본/장치: 출력장치(스피커) 루프백 — 시스템 전체 믹스(창 상태 무관).
+//! - 프로세스: `new_application_loopback_client(pid, tree)` 로 **특정 앱(과 자식)만** 캡처.
+//!
+//! `autoconvert: true` 로 48kHz·스테레오·f32 로 자동 변환 → (옵션) DSP → songbird RawAdapter.
+//! 믹서 스레드를 막지 않도록 read()는 **논블로킹**이고, 시작 시 프리롤(지터버퍼)을 쌓아
+//! 간헐적 끊김을 줄인다.
 
 use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
-use anyhow::{anyhow, Result};
-use wasapi::{Device, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
+use anyhow::{Result, anyhow};
+use wasapi::{
+    AudioClient, Device, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat,
+};
+
+use crate::dsp::DspChain;
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u32 = 2;
 
-/// 지연 상한 ≈ 0.5초 분량. 넘으면 가장 오래된 바이트를 버린다.
-const MAX_BYTES: usize = (SAMPLE_RATE as usize) * (CHANNELS as usize) * 4 / 2;
+const BYTES_PER_SEC: usize = SAMPLE_RATE as usize * CHANNELS as usize * 4; // f32
+/// 시작 프리롤(지터버퍼) ≈ 60ms — 쌓일 때까지 무음을 내보내 쿠션 확보.
+const PRIME_BYTES: usize = BYTES_PER_SEC * 60 / 1000;
+/// 지연 상한 ≈ 250ms. 넘으면 가장 오래된 바이트를 버린다.
+const MAX_BYTES: usize = BYTES_PER_SEC * 250 / 1000;
+
+/// 캡처 대상.
+pub enum CaptureSource {
+    DefaultDevice,
+    Device(String),
+    Process(u32),
+}
+
+impl CaptureSource {
+    /// env(YTCAST_PROCESS > YTCAST_DEVICE) 로 소스 결정.
+    pub fn from_env() -> Result<CaptureSource> {
+        if let Ok(p) = std::env::var("YTCAST_PROCESS") {
+            let p = p.trim();
+            if !p.is_empty() {
+                return Ok(CaptureSource::Process(crate::process::resolve(p)?));
+            }
+        }
+        if let Ok(d) = std::env::var("YTCAST_DEVICE") {
+            let d = d.trim();
+            if !d.is_empty() {
+                return Ok(CaptureSource::Device(d.to_string()));
+            }
+        }
+        Ok(CaptureSource::DefaultDevice)
+    }
+
+    fn label(&self) -> String {
+        match self {
+            CaptureSource::DefaultDevice => "기본 스피커(시스템 전체 믹스)".to_string(),
+            CaptureSource::Device(n) => format!("출력장치 '{n}'"),
+            CaptureSource::Process(pid) => format!(
+                "프로세스 {pid}{}",
+                crate::process::name_of(*pid)
+                    .map(|n| format!(" ({n})"))
+                    .unwrap_or_default()
+            ),
+        }
+    }
+}
 
 struct Shared {
     buf: Mutex<VecDeque<u8>>,
-    cv: Condvar,
     closed: AtomicBool,
+    primed: AtomicBool,
     captured: AtomicU64,
     dropped: AtomicU64,
     error: Mutex<Option<String>>,
@@ -34,8 +82,8 @@ impl Shared {
     fn new() -> Self {
         Shared {
             buf: Mutex::new(VecDeque::with_capacity(MAX_BYTES)),
-            cv: Condvar::new(),
             closed: AtomicBool::new(false),
+            primed: AtomicBool::new(false),
             captured: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             error: Mutex::new(None),
@@ -43,7 +91,8 @@ impl Shared {
     }
 }
 
-/// songbird 로 넘길 라이브 PCM 리더. 큐가 비면 무음을 돌려줘 트랙이 끊기지 않게 한다.
+/// songbird 로 넘길 라이브 PCM 리더. **논블로킹** — 데이터 없으면 즉시 무음을 돌려줘
+/// 믹서 타이밍이 밀리지 않게 한다(끊김 방지).
 pub struct CaptureReader {
     shared: Arc<Shared>,
 }
@@ -53,46 +102,45 @@ impl Read for CaptureReader {
         if out.is_empty() {
             return Ok(0);
         }
+        if self.shared.closed.load(Ordering::Acquire) {
+            return Ok(0); // EOF → 트랙 종료
+        }
         let mut buf = self.shared.buf.lock().unwrap();
-        loop {
-            if self.shared.closed.load(Ordering::Acquire) {
-                return Ok(0); // EOF → 트랙 종료
-            }
-            if !buf.is_empty() {
-                let n = out.len().min(buf.len());
-                for (i, b) in buf.drain(..n).enumerate() {
-                    out[i] = b;
-                }
-                return Ok(n);
-            }
-            // 언더런: 잠깐 기다렸다가 그래도 없으면 무음으로 채워 실시간 페이싱 유지
-            let (g, res) = self
-                .shared
-                .cv
-                .wait_timeout(buf, Duration::from_millis(20))
-                .unwrap();
-            buf = g;
-            if res.timed_out() && buf.is_empty() {
-                for b in out.iter_mut() {
-                    *b = 0;
-                }
+
+        // 프리롤이 충분히 쌓이기 전엔 무음(시작 쿠션)
+        if !self.shared.primed.load(Ordering::Acquire) {
+            if buf.len() >= PRIME_BYTES {
+                self.shared.primed.store(true, Ordering::Release);
+            } else {
+                drop(buf);
+                out.fill(0);
                 return Ok(out.len());
             }
         }
+        if buf.is_empty() {
+            drop(buf);
+            out.fill(0); // 언더런 → 무음(논블로킹)
+            return Ok(out.len());
+        }
+        let n = out.len().min(buf.len());
+        for (i, b) in buf.drain(..n).enumerate() {
+            out[i] = b;
+        }
+        Ok(n)
     }
 }
 
-/// 캡처 스레드 제어 핸들. stop() 으로 종료(리더는 EOF 를 받아 트랙이 끝난다).
+/// 캡처 스레드 제어 핸들.
 pub struct CaptureHandle {
     shared: Arc<Shared>,
     join: Option<thread::JoinHandle<()>>,
-    device_label: String,
+    source_label: String,
+    dsp_label: Option<String>,
 }
 
 impl CaptureHandle {
     pub fn stop(&mut self) {
         self.shared.closed.store(true, Ordering::Release);
-        self.shared.cv.notify_all();
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
@@ -109,37 +157,45 @@ impl CaptureHandle {
     pub fn error(&self) -> Option<String> {
         self.shared.error.lock().unwrap().clone()
     }
-    pub fn device_label(&self) -> &str {
-        &self.device_label
+    pub fn source_label(&self) -> &str {
+        &self.source_label
+    }
+    pub fn dsp_label(&self) -> Option<&str> {
+        self.dsp_label.as_deref()
     }
 }
 
-/// 캡처 시작. WASAPI 초기화가 끝날 때까지 기다렸다가 (핸들, 리더) 를 돌려준다.
-pub fn start(device_name: Option<String>) -> Result<(CaptureHandle, CaptureReader)> {
+/// 캡처 시작. WASAPI 초기화가 끝날 때까지 기다렸다 (핸들, 리더) 반환.
+pub fn start(
+    source: CaptureSource,
+    dsp: Option<DspChain>,
+) -> Result<(CaptureHandle, CaptureReader)> {
     let shared = Arc::new(Shared::new());
-    let label = device_name.clone().unwrap_or_else(|| "기본 스피커(시스템 전체 믹스)".to_string());
+    let source_label = source.label();
+    let dsp_label = dsp.as_ref().map(|d| d.label().to_string());
+
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let sh = shared.clone();
     let join = thread::Builder::new()
         .name("pepsi-capture".into())
         .spawn(move || {
-            if let Err(e) = run_capture(&sh, device_name, &tx) {
+            if let Err(e) = run_capture(&sh, source, dsp, &tx) {
                 let msg = e.to_string();
                 *sh.error.lock().unwrap() = Some(msg.clone());
-                let _ = tx.send(Err(msg)); // 초기화 전 실패 시 통보(이미 성공 통보했으면 무시됨)
+                let _ = tx.send(Err(msg));
             }
         })?;
 
     match rx.recv() {
-        Ok(Ok(())) => {
-            let handle = CaptureHandle {
+        Ok(Ok(())) => Ok((
+            CaptureHandle {
                 shared: shared.clone(),
                 join: Some(join),
-                device_label: label,
-            };
-            let reader = CaptureReader { shared };
-            Ok((handle, reader))
-        }
+                source_label,
+                dsp_label,
+            },
+            CaptureReader { shared },
+        )),
         Ok(Err(e)) => Err(anyhow!(e)),
         Err(_) => Err(anyhow!("캡처 스레드가 초기화 전에 종료됨")),
     }
@@ -147,16 +203,33 @@ pub fn start(device_name: Option<String>) -> Result<(CaptureHandle, CaptureReade
 
 fn run_capture(
     shared: &Arc<Shared>,
-    device_name: Option<String>,
+    source: CaptureSource,
+    mut dsp: Option<DspChain>,
     tx: &Sender<Result<(), String>>,
 ) -> Result<()> {
     let _ = wasapi::initialize_mta();
 
-    let device = match device_name {
-        Some(ref name) => find_render_device(name)?,
-        None => DeviceEnumerator::new()?.get_default_device(&Direction::Render)?,
+    let (mut audio_client, buffer_duration_hns): (AudioClient, i64) = match source {
+        CaptureSource::Process(pid) => {
+            // 프로세스 루프백: get_device_period 가 동작 안 하므로 20ms(=200_000 hns) 고정
+            (
+                AudioClient::new_application_loopback_client(pid, true)?,
+                200_000,
+            )
+        }
+        CaptureSource::Device(name) => {
+            let ac = find_render_device(&name)?.get_iaudioclient()?;
+            let (_d, min_t) = ac.get_device_period()?;
+            (ac, min_t)
+        }
+        CaptureSource::DefaultDevice => {
+            let ac = DeviceEnumerator::new()?
+                .get_default_device(&Direction::Render)?
+                .get_iaudioclient()?;
+            let (_d, min_t) = ac.get_device_period()?;
+            (ac, min_t)
+        }
     };
-    let mut audio_client = device.get_iaudioclient()?;
 
     let format = WaveFormat::new(
         32,
@@ -166,10 +239,9 @@ fn run_capture(
         CHANNELS as usize,
         None,
     );
-    let (_def_time, min_time) = audio_client.get_device_period()?;
     let mode = StreamMode::EventsShared {
         autoconvert: true,
-        buffer_duration_hns: min_time,
+        buffer_duration_hns,
     };
     audio_client.initialize_client(&format, &Direction::Capture, &mode)?;
 
@@ -181,31 +253,45 @@ fn run_capture(
 
     let mut local: VecDeque<u8> = VecDeque::new();
     while !shared.closed.load(Ordering::Acquire) {
-        // 무음 구간엔 이벤트가 안 와 타임아웃될 수 있다 → 종료 플래그만 확인하고 계속
         if event.wait_for_event(200).is_err() {
-            continue;
+            continue; // 무음 구간 타임아웃 → 종료 플래그만 확인하고 계속
         }
         capture_client.read_from_device_to_deque(&mut local)?;
-        if !local.is_empty() {
-            push_bytes(shared, &mut local);
+        if local.is_empty() {
+            continue;
         }
+        let mut bytes: Vec<u8> = local.drain(..).collect();
+        if let Some(dsp) = &mut dsp {
+            apply_dsp(dsp, &mut bytes);
+        }
+        push_bytes(shared, &bytes);
     }
     let _ = audio_client.stop_stream();
     Ok(())
 }
 
-fn push_bytes(shared: &Arc<Shared>, local: &mut VecDeque<u8>) {
-    let incoming = local.len() as u64;
+fn apply_dsp(dsp: &mut DspChain, bytes: &mut [u8]) {
+    let mut floats: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    dsp.process(&mut floats);
+    for (i, f) in floats.iter().enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
+    }
+}
+
+fn push_bytes(shared: &Arc<Shared>, bytes: &[u8]) {
     let mut buf = shared.buf.lock().unwrap();
-    buf.extend(local.drain(..));
-    shared.captured.fetch_add(incoming, Ordering::Relaxed);
+    buf.extend(bytes.iter().copied());
+    shared
+        .captured
+        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
     if buf.len() > MAX_BYTES {
         let excess = buf.len() - MAX_BYTES;
         buf.drain(..excess);
         shared.dropped.fetch_add(excess as u64, Ordering::Relaxed);
     }
-    drop(buf);
-    shared.cv.notify_one();
 }
 
 fn find_render_device(name: &str) -> Result<Device> {
@@ -231,7 +317,10 @@ pub fn list_render_devices() -> Result<Vec<String>> {
     let mut out = Vec::new();
     for i in 0..n {
         let dev = coll.get_device_at_index(i)?;
-        out.push(dev.get_friendlyname().unwrap_or_else(|_| format!("device {i}")));
+        out.push(
+            dev.get_friendlyname()
+                .unwrap_or_else(|_| format!("device {i}")),
+        );
     }
     Ok(out)
 }
