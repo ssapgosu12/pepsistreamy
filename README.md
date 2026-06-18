@@ -5,6 +5,8 @@
 
 > 포트포워딩도, 빌리는 서버도 필요 없습니다. 봇이 디스코드로 *바깥으로* 접속(outbound)하기 때문입니다.
 
+> 🦀 **네이티브(Rust) 버전이 있습니다.** 파이썬 설치 없이 **단일 실행파일(~16MB)** 로 쓰려면 [`rust/`](rust/) 폴더와 [Releases](https://github.com/ssapgosu12/pepsistreamy/releases) 의 `pepsistreamy.exe` 를 보세요. 친구에게는 exe 하나만 주면 됩니다. 기능은 이 문서와 동일합니다.
+
 ```
  [ 내 PC (Windows) ]
    브라우저 (유튜브 로그인·재생)
