@@ -57,7 +57,7 @@
 ## 요구사항
 
 - **Windows 10/11** (WASAPI 루프백 캡처 사용)
-- **Python 3.9+** ([python.org](https://www.python.org/downloads/) 설치 시 "Add to PATH" 체크)
+- **Python 3.11 이상** (최신 numpy가 3.11+ 요구. 3.12에서 빌드·테스트) — [python.org](https://www.python.org/downloads/) 설치 시 "Add to PATH" 체크
 - 디스코드 계정 + 내가 봇을 추가할 수 있는 서버
 - 의존성(자동 설치됨): `discord.py[voice]`, `soundcard`, `numpy`, `python-dotenv`
   - 음성 송출에 필요한 `PyNaCl`/`libopus`는 `discord.py[voice]`에 포함되어 자동 처리됩니다.
