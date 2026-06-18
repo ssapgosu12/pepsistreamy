@@ -678,7 +678,7 @@ impl App {
         state.select(Some(self.sel.min(1)));
         let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title(
-                "로컬 모니터 — 송출자도 필터된 소리 듣기 (프로세스캡처+앱 볼륨믹서 뮤트 권장)",
+                "로컬 모니터 — 송출자도 필터본 듣기. 원본 안 들리게: 그 앱 출력을 VB-CABLE 로 (뮤트는 캡처도 죽임)",
             ))
             .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
             .highlight_symbol("➤ ");
