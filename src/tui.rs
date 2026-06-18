@@ -678,7 +678,7 @@ impl App {
         state.select(Some(self.sel.min(1)));
         let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title(
-                "로컬 모니터 — 송출자도 필터본 듣기. 원본 안 들리게: 그 앱 출력을 VB-CABLE 로 (뮤트는 캡처도 죽임)",
+                "로컬 모니터 — 필터본만: 앱 출력을 다른 장치(또는 VB-CABLE)로, 모니터는 내 장치로 (뮤트 금지)",
             ))
             .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
             .highlight_symbol("➤ ");
