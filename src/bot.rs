@@ -40,6 +40,14 @@ pub fn listeners() -> usize {
 pub fn status() -> String {
     STATUS.lock().unwrap().clone()
 }
+/// (소스 라벨, 캡처 오류) — 실행 화면 표시용.
+pub fn capture_info() -> Option<(String, Option<String>)> {
+    slot()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|h| (h.source_label().to_string(), h.error()))
+}
 
 fn set_status(msg: impl Into<String>) {
     let msg = msg.into();
@@ -152,7 +160,9 @@ fn env_set(key: &str) -> bool {
 }
 
 /// setting.ini(또는 env) 를 새로 읽어 (소스, DSP, 모니터) 구성.
-fn build_config() -> anyhow::Result<(CaptureSource, Option<DspChain>, Option<MonitorSpec>)> {
+pub(crate) fn build_config()
+-> anyhow::Result<(CaptureSource, Option<DspChain>, Option<MonitorSpec>)> {
+    dotenvy::dotenv().ok();
     let s = Settings::load();
     let sr = capture::SAMPLE_RATE as f32;
     let source = if env_set("YTCAST_PROCESS") || env_set("YTCAST_DEVICE") {

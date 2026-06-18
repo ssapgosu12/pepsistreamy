@@ -265,13 +265,33 @@ fn run_capture(
         None => None,
     };
 
+    let debug = std::env::var("YTCAST_DEBUG").is_ok();
+    let mut dbg_i = 0u64;
     let mut local: VecDeque<u8> = VecDeque::new();
     while !shared.closed.load(Ordering::Acquire) {
         if event.wait_for_event(200).is_err() {
+            if debug && dbg_i < 12 {
+                eprintln!("[cap-dbg] {dbg_i}: wait_for_event TIMEOUT");
+                dbg_i += 1;
+            }
             decay_level();
             continue; // 무음 구간 타임아웃 → 종료 플래그만 확인하고 계속
         }
-        capture_client.read_from_device_to_deque(&mut local)?;
+        if let Err(e) = capture_client.read_from_device_to_deque(&mut local) {
+            if debug {
+                eprintln!("[cap-dbg] read_from_device error: {e}");
+            }
+            return Err(e.into());
+        }
+        if debug && dbg_i < 12 && local.len() >= 404 {
+            let s0 = f32::from_le_bytes([local[0], local[1], local[2], local[3]]);
+            let s100 = f32::from_le_bytes([local[400], local[401], local[402], local[403]]);
+            eprintln!(
+                "[cap-dbg] {dbg_i}: read {} bytes  sample[0]={s0:.5} sample[100]={s100:.5}",
+                local.len()
+            );
+            dbg_i += 1;
+        }
         if local.is_empty() {
             decay_level();
             continue;
@@ -351,18 +371,39 @@ fn push_bytes(shared: &Arc<Shared>, bytes: &[u8]) {
 }
 
 pub(crate) fn find_render_device(name: &str) -> Result<Device> {
+    let want = name.trim().to_lowercase();
+    if want.is_empty() {
+        return Err(anyhow!("장치 이름이 비어 있습니다"));
+    }
     let coll = DeviceEnumerator::new()?.get_device_collection(&Direction::Render)?;
     let n = coll.get_nbr_devices()?;
-    let want = name.to_lowercase();
+    // 정확히 일치하는 장치를 우선(예: 'CABLE Input' 과 'CABLE In 16ch' 처럼 비슷한 이름 구분).
+    // 없으면 부분일치 중 첫 번째.
+    let mut contains: Option<(Device, String)> = None;
     for i in 0..n {
         let dev = coll.get_device_at_index(i)?;
         if let Ok(fname) = dev.get_friendlyname() {
-            if fname.to_lowercase().contains(&want) {
+            let fl = fname.to_lowercase();
+            if fl == want {
+                if std::env::var("YTCAST_DEBUG").is_ok() {
+                    eprintln!("[cap-dbg] find_render_device exact: {fname}");
+                }
                 return Ok(dev);
+            }
+            if contains.is_none() && fl.contains(&want) {
+                contains = Some((dev, fname));
             }
         }
     }
-    Err(anyhow!("'{name}' 와 일치하는 출력장치를 못 찾음"))
+    match contains {
+        Some((dev, fname)) => {
+            if std::env::var("YTCAST_DEBUG").is_ok() {
+                eprintln!("[cap-dbg] find_render_device contains: {fname}");
+            }
+            Ok(dev)
+        }
+        None => Err(anyhow!("'{name}' 와 일치하는 출력장치를 못 찾음")),
+    }
 }
 
 /// 루프백 캡처 가능한 출력장치(스피커) 이름 목록.

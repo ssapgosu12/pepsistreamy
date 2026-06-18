@@ -66,7 +66,8 @@ struct App {
     values: Vec<String>, // 항목별 실제 값(프로세스는 이름만 저장)
     input: String,       // 토큰/프로필명 입력
     msg: String,
-    proc_all: bool, // 프로세스 픽커: 전체(true) vs 소리나는 앱만(false)
+    proc_all: bool,    // 프로세스 픽커: 전체(true) vs 소리나는 앱만(false)
+    legacy_pick: bool, // DevicePick 이 레거시(케이블)용인가
     start_bot: bool,
     quit: bool,
 }
@@ -82,6 +83,7 @@ pub fn config() -> Result<bool> {
         input: String::new(),
         msg: String::new(),
         proc_all: false,
+        legacy_pick: false,
         start_bot: false,
         quit: false,
     };
@@ -225,7 +227,11 @@ impl App {
             Screen::SourceKind => self.source_kind_enter(),
             Screen::DevicePick => {
                 if let Some(name) = self.values.get(self.sel).cloned() {
-                    self.s.source = SourceSel::Device(name);
+                    self.s.source = if self.legacy_pick {
+                        SourceSel::Legacy(name)
+                    } else {
+                        SourceSel::Device(name)
+                    };
                     self.msg = "출력장치 캡처로 설정.".into();
                     self.back_to_menu();
                 }
@@ -347,6 +353,7 @@ impl App {
                 self.back_to_menu();
             }
             1 => {
+                self.legacy_pick = false;
                 self.items = crate::capture::list_render_devices().unwrap_or_default();
                 self.values = self.items.clone();
                 self.sel = 0;
@@ -358,23 +365,26 @@ impl App {
                 self.screen = Screen::ProcessPick;
             }
             _ => {
-                // 레거시(VB-CABLE)
-                let cable = crate::capture::list_render_devices()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|n| n.to_uppercase().contains("CABLE"));
-                match cable {
-                    Some(name) => {
-                        self.s.source = SourceSel::Legacy(name);
-                        self.msg =
-                            "레거시(VB-CABLE) 캡처로 설정. 그 앱 출력을 CABLE 로 보내세요.".into();
-                        self.back_to_menu();
-                    }
-                    None => {
-                        self.msg =
-                            "VB-CABLE 미설치. 'o' 키로 공식 다운로드 페이지를 여세요.".into();
-                    }
+                // 레거시(VB-CABLE): 자동선택하지 말고 직접 케이블 장치를 고르게 한다
+                // (CABLE Input vs CABLE In 16ch 처럼 케이블이 여러 개일 수 있음).
+                self.legacy_pick = true;
+                let devs = crate::capture::list_render_devices().unwrap_or_default();
+                if devs.is_empty() {
+                    self.msg = "출력장치를 못 읽었습니다.".into();
+                    return;
                 }
+                self.items = devs.clone();
+                self.values = devs;
+                // CABLE 장치가 있으면 거기에 커서를 둔다
+                self.sel = self
+                    .items
+                    .iter()
+                    .position(|n| n.to_uppercase().contains("CABLE"))
+                    .unwrap_or(0);
+                self.screen = Screen::DevicePick;
+                self.msg =
+                    "그 앱 출력을 보낸 케이블(보통 CABLE Input)을 고르세요. 없으면 'o'로 VB-CABLE 설치."
+                        .into();
             }
         }
     }
@@ -461,7 +471,12 @@ impl App {
             ),
             Screen::DevicePick => {
                 let items = self.items.clone();
-                self.render_list(f, chunks[1], "출력장치 선택", &items)
+                let title = if self.legacy_pick {
+                    "레거시: 캡처할 케이블 장치 선택 (보통 CABLE Input)"
+                } else {
+                    "출력장치 선택"
+                };
+                self.render_list(f, chunks[1], title, &items)
             }
             Screen::ProcessPick => {
                 let items = self.items.clone();
@@ -730,7 +745,7 @@ fn draw_running(f: &mut Frame) {
     let area = f.area();
     let chunks = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Length(4),
+        Constraint::Length(6),
         Constraint::Length(3),
         Constraint::Min(1),
     ])
@@ -752,6 +767,11 @@ fn draw_running(f: &mut Frame) {
             crate::bot::listeners()
         )),
         Line::from(format!("상태: {}", crate::bot::status())),
+        match crate::bot::capture_info() {
+            Some((src, Some(err))) => Line::from(format!("소스: {src}  ⚠️ {err}")),
+            Some((src, None)) => Line::from(format!("소스: {src}")),
+            None => Line::from("소스: (대기)"),
+        },
     ])
     .block(Block::default().borders(Borders::ALL).title("상태"))
     .wrap(Wrap { trim: true });

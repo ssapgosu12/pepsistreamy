@@ -1,6 +1,6 @@
 [package]
 name = "pepsistreamy"
-version = "2.3.0"
+version = "2.3.1"
 edition = "2024"
 description = "내 PC 소리(유튜브 등)를 디스코드 음성 채널로 실시간 방송하는 네이티브 CLI"
 license = "MIT"

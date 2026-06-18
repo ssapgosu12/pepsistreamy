@@ -24,6 +24,10 @@ async fn main() -> Result<()> {
     match arg.as_str() {
         "tui" | "config" | "setup" => tui_session().await,
         "run" => bot::run().await,
+        "_captest" => {
+            captest().await;
+            Ok(())
+        }
         "devices" => {
             cmd_devices();
             Ok(())
@@ -53,6 +57,34 @@ async fn main() -> Result<()> {
             print_help();
             std::process::exit(2);
         }
+    }
+}
+
+/// (진단용 숨김) 봇과 동일하게 tokio 태스크에서 캡처를 시작하고 전역 레벨이 갱신되는지 본다.
+async fn captest() {
+    let (source, dsp, _m) = match bot::build_config() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("설정 오류: {e}");
+            return;
+        }
+    };
+    println!("[captest] tokio 태스크에서 캡처 시작...");
+    let _keep = tokio::spawn(async move {
+        match capture::start(source, dsp, None) {
+            Ok((h, _r)) => {
+                // reader 안 읽음(봇처럼). 캡처 스레드는 계속 LEVEL 갱신해야 함.
+                std::thread::sleep(std::time::Duration::from_secs(8));
+                drop(h);
+            }
+            Err(e) => eprintln!("[captest] 캡처 시작 실패: {e}"),
+        }
+    });
+    for _ in 0..16 {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let l = capture::current_level();
+        let db = if l < 1e-4 { -90.0 } else { 20.0 * l.log10() };
+        println!("[captest] level: {db:6.1} dBFS");
     }
 }
 
@@ -134,15 +166,14 @@ fn cmd_processes() {
 fn cmd_meter(seconds: f64) {
     use std::io::{IsTerminal, Read, Write};
 
-    dotenvy::dotenv().ok();
-    let source = match capture::CaptureSource::from_env() {
-        Ok(s) => s,
+    // 봇과 똑같은 설정(setting.ini 의 소스/DSP)을 그대로 써서 진단할 수 있게 한다.
+    let (source, dsp, _monitor) = match bot::build_config() {
+        Ok(v) => v,
         Err(e) => {
-            eprintln!("캡처 소스 결정 실패: {e}");
+            eprintln!("설정 오류: {e}");
             return;
         }
     };
-    let dsp = dsp::DspChain::from_env(capture::SAMPLE_RATE as f32);
     let (mut handle, mut reader) = match capture::start(source, dsp, None) {
         Ok(v) => v,
         Err(e) => {
