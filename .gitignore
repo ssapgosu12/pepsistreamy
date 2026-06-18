@@ -1,12 +1,11 @@
+# 비밀/런타임 설정 — 커밋 금지
 .env
-.venv/
-__pycache__/
-*.pyc
+setting.ini
 
 # Rust 빌드 산출물
 target/
-rust/target/
 
-# 런타임 설정(암호화된 토큰 포함) — 커밋 금지
-setting.ini
-rust/setting.ini
+# Python(legacy)
+.venv/
+__pycache__/
+*.pyc
